@@ -22,15 +22,15 @@ from hmmlearn.hmm import GaussianHMM
 # ============================================================================
 
 TIMEFRAME_CONFIG = {
-    "30m": {
-        "yf_interval": "30m",
-        "yf_period": "60d",
+    "1H": {
+        "yf_interval": "1h",
+        "yf_period": "730d",
         "resample_rule": None,
         "vol_window": 20,
         "momentum_ema_span": 14,
         "momentum_slope_window": 5,
         "min_bars_required": 100,
-        "label": "30 Minutos",
+        "label": "1 Hora",
     },
     "4H": {
         "yf_interval": "1h",
@@ -445,7 +445,7 @@ def _fetch_crypto(ticker: str, timeframe: str, config: dict) -> pd.DataFrame:
 
     try:
         exchange = ccxt.binance({"enableRateLimit": True})
-        tf_map = {"30m": "30m", "4H": "1h", "1D": "1d", "1W": "1d"}
+        tf_map = {"1H": "1h", "4H": "1h", "1D": "1d", "1W": "1d"}
         ccxt_tf = tf_map.get(timeframe, "1d")
         limit = 1000
         all_ohlcv = exchange.fetch_ohlcv(ticker, timeframe=ccxt_tf, limit=limit)
@@ -592,6 +592,154 @@ def get_transition_matrix(model: GaussianHMM, label_map: dict, sorted_order) -> 
     reordered = transmat[sorted_order][:, sorted_order]
     labels = [label_map[idx] for idx in sorted_order]
     return pd.DataFrame(reordered, index=labels, columns=labels)
+
+
+def project_regimes(model: GaussianHMM, current_regime: int, n_periods: int,
+                    label_map: dict, color_map: dict, sorted_order) -> pd.DataFrame:
+    """
+    Proyecta probabilidades de regimen hacia adelante N periodos
+    usando potencias sucesivas de la matriz de transicion.
+
+    En t+1: P(state) = transmat[current_regime]
+    En t+k: P(state) = P(t+k-1) @ transmat  (propagacion iterativa)
+
+    Returns DataFrame con columnas = regimenes, filas = periodos futuros (t+1..t+N)
+    """
+    transmat = model.transmat_
+    n_states = model.n_components
+
+    # Vector de estado inicial: 100% en el regimen actual
+    state_vec = np.zeros(n_states)
+    state_vec[current_regime] = 1.0
+
+    projections = []
+    for step in range(1, n_periods + 1):
+        state_vec = state_vec @ transmat
+        projections.append(state_vec.copy())
+
+    # Crear DataFrame con labels semanticos, reordenado
+    labels = [label_map[idx] for idx in sorted_order]
+    proj_array = np.array(projections)
+    # Reordenar columnas segun sorted_order
+    proj_reordered = proj_array[:, sorted_order]
+
+    df_proj = pd.DataFrame(
+        proj_reordered,
+        index=[f"t+{i}" for i in range(1, n_periods + 1)],
+        columns=labels,
+    )
+    return df_proj
+
+
+def plot_projection(proj_df: pd.DataFrame, color_map: dict, label_map: dict,
+                    sorted_order, timeframe: str) -> go.Figure:
+    """
+    Grafico de area apilada mostrando la evolucion de probabilidades
+    de regimen proyectadas hacia adelante.
+    """
+    fig = go.Figure()
+
+    # Mapeo de timeframe a unidad legible
+    tf_units = {"1H": "horas", "4H": "periodos de 4h", "1D": "dias", "1W": "semanas"}
+    unit = tf_units.get(timeframe, "periodos")
+
+    labels = proj_df.columns.tolist()
+    colors = [color_map[idx] for idx in sorted_order]
+
+    for i, (label, color) in enumerate(zip(labels, colors)):
+        fig.add_trace(
+            go.Scatter(
+                x=proj_df.index,
+                y=proj_df[label],
+                name=label,
+                mode="lines",
+                line=dict(width=0.5, color=color),
+                stackgroup="one",
+                fillcolor=color.replace(")", ",0.6)").replace("rgb", "rgba")
+                    if "rgb" in color else color + "99",
+                hovertemplate=f"{label}: " + "%{y:.1%}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        plot_bgcolor="#131722",
+        paper_bgcolor="#131722",
+        font=dict(family="Trebuchet MS, Segoe UI, sans-serif", color="#D1D4DC", size=13),
+        height=350,
+        margin=dict(l=60, r=20, t=40, b=40),
+        xaxis=dict(
+            title=f"Periodos hacia adelante ({unit})",
+            gridcolor="#1E222D",
+            color="#787B86",
+        ),
+        yaxis=dict(
+            title="Probabilidad",
+            gridcolor="#1E222D",
+            color="#787B86",
+            tickformat=".0%",
+            range=[0, 1],
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12, color="#D1D4DC"),
+            bgcolor="rgba(19,23,34,0.8)",
+            bordercolor="#2A2E39",
+            borderwidth=1,
+        ),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#1E222D", font_color="#D1D4DC", bordercolor="#2A2E39"),
+    )
+
+    return fig
+
+
+def render_projection_summary(proj_df: pd.DataFrame, color_map: dict, label_map: dict,
+                              sorted_order, n_periods: int, timeframe: str):
+    """Renderiza un resumen de la proyeccion: regimen mas probable en t+1, t+mid, t+N."""
+    tf_units = {"1H": "h", "4H": "x4h", "1D": "d", "1W": "w"}
+    unit = tf_units.get(timeframe, "p")
+
+    checkpoints = [0]  # t+1 siempre
+    if n_periods > 2:
+        checkpoints.append(n_periods // 2 - 1)  # mitad
+    if n_periods > 1:
+        checkpoints.append(n_periods - 1)  # final
+
+    colors = [color_map[idx] for idx in sorted_order]
+    labels = proj_df.columns.tolist()
+
+    cards_html = '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
+    for cp in checkpoints:
+        row = proj_df.iloc[cp]
+        top_regime = row.idxmax()
+        top_prob = row.max()
+        # Find color for top regime
+        top_color = "#D1D4DC"
+        for idx in sorted_order:
+            if label_map[idx] == top_regime:
+                top_color = color_map[idx]
+                break
+        emoji = REGIME_EMOJIS.get(top_regime, "")
+        period_label = f"t+{cp + 1}"
+
+        cards_html += f"""
+        <div style="flex:1; min-width:140px; background:#1E222D; border-radius:8px;
+                    padding:14px; border:1px solid #2A2E39; border-top:3px solid {top_color};">
+            <p style="color:#787B86; font-size:0.75rem; text-transform:uppercase;
+                      letter-spacing:0.8px; margin:0 0 6px 0;">{period_label} ({(cp+1)}{unit})</p>
+            <p style="color:{top_color}; font-size:1.1rem; font-weight:700; margin:0 0 2px 0;">
+                {emoji} {top_regime}
+            </p>
+            <p style="color:#D1D4DC; font-family:Consolas,Monaco,monospace;
+                      font-size:1.3rem; font-weight:700; margin:0;">{top_prob:.1%}</p>
+        </div>
+        """
+    cards_html += "</div>"
+    st.markdown(cards_html, unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -1009,6 +1157,21 @@ def main():
             help="Cantidad de estados ocultos del HMM (3=simple, 7=granular)",
         )
 
+        st.divider()
+        st.markdown(
+            '<p style="color:#787B86; font-size:0.75rem; letter-spacing:1px; '
+            'text-transform:uppercase; margin-bottom:8px;">Proyeccion</p>',
+            unsafe_allow_html=True,
+        )
+
+        n_projection = st.slider(
+            "Periodos hacia adelante",
+            min_value=1,
+            max_value=30,
+            value=10,
+            help="Cuantos periodos proyectar usando la matriz de transicion del HMM",
+        )
+
         st.markdown("<br>", unsafe_allow_html=True)
         train_button = st.button("🚀 Entrenar Modelo", use_container_width=True)
 
@@ -1022,7 +1185,7 @@ def main():
         st.session_state.trained = False
 
     if train_button:
-        _run_pipeline(ticker, timeframe, n_regimes)
+        _run_pipeline(ticker, timeframe, n_regimes, n_projection)
 
     if st.session_state.trained:
         _display_results()
@@ -1044,8 +1207,8 @@ def main():
         )
 
 
-def _run_pipeline(ticker: str, timeframe: str, n_regimes: int):
-    """Ejecuta el pipeline completo: fetch -> features -> train -> decode."""
+def _run_pipeline(ticker: str, timeframe: str, n_regimes: int, n_projection: int = 10):
+    """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project."""
     config = TIMEFRAME_CONFIG[timeframe]
 
     with st.spinner(f"Obteniendo datos para {ticker} ({timeframe})..."):
@@ -1096,6 +1259,7 @@ def _run_pipeline(ticker: str, timeframe: str, n_regimes: int):
     st.session_state.ticker = ticker
     st.session_state.timeframe = timeframe
     st.session_state.n_regimes = n_regimes
+    st.session_state.n_projection = n_projection
     st.session_state.converged = converged
     st.session_state.trained = True
 
@@ -1156,7 +1320,23 @@ def _display_results():
             unsafe_allow_html=True,
         )
 
-    # ── 4. Matriz de transicion ──────────────────────────────────────
+    # ── 4. Proyeccion de regimenes hacia adelante ──────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔮 Proyeccion de Regimenes</div>', unsafe_allow_html=True)
+
+    n_projection = st.session_state.get("n_projection", 10)
+    proj_df = project_regimes(model, current_regime, n_projection, label_map, color_map, sorted_order)
+
+    # Resumen: regimen mas probable en checkpoints clave
+    render_projection_summary(proj_df, color_map, label_map, sorted_order, n_projection, timeframe)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Grafico de area apilada con evolucion de probabilidades
+    fig_proj = plot_projection(proj_df, color_map, label_map, sorted_order, timeframe)
+    st.plotly_chart(fig_proj, use_container_width=True, config={"displaylogo": False})
+
+    # ── 5. Matriz de transicion ──────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">Matriz de Transicion</div>', unsafe_allow_html=True)
 
@@ -1173,7 +1353,7 @@ def _display_results():
         )
         render_transition_table(transition_df)
 
-    # ── 5. Features plot (debug) ─────────────────────────────────────
+    # ── 6. Features plot (debug) ─────────────────────────────────────
     with st.expander("📊 Features del Modelo (Debug / Analisis)"):
         fig_features = make_subplots(
             rows=3,
