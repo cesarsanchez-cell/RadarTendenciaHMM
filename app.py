@@ -712,7 +712,7 @@ def render_projection_summary(proj_df: pd.DataFrame, color_map: dict, label_map:
     colors = [color_map[idx] for idx in sorted_order]
     labels = proj_df.columns.tolist()
 
-    cards_html = '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
+    cards_html = '<div style="display:flex;gap:12px;flex-wrap:wrap;">'
     for cp in checkpoints:
         row = proj_df.iloc[cp]
         top_regime = row.idxmax()
@@ -726,20 +726,268 @@ def render_projection_summary(proj_df: pd.DataFrame, color_map: dict, label_map:
         emoji = REGIME_EMOJIS.get(top_regime, "")
         period_label = f"t+{cp + 1}"
 
-        cards_html += f"""
-        <div style="flex:1; min-width:140px; background:#1E222D; border-radius:8px;
-                    padding:14px; border:1px solid #2A2E39; border-top:3px solid {top_color};">
-            <p style="color:#787B86; font-size:0.75rem; text-transform:uppercase;
-                      letter-spacing:0.8px; margin:0 0 6px 0;">{period_label} ({(cp+1)}{unit})</p>
-            <p style="color:{top_color}; font-size:1.1rem; font-weight:700; margin:0 0 2px 0;">
-                {emoji} {top_regime}
-            </p>
-            <p style="color:#D1D4DC; font-family:Consolas,Monaco,monospace;
-                      font-size:1.3rem; font-weight:700; margin:0;">{top_prob:.1%}</p>
-        </div>
-        """
-    cards_html += "</div>"
-    st.markdown(cards_html, unsafe_allow_html=True)
+        cards_html += (
+            f'<div style="flex:1;min-width:140px;background:#1E222D;border-radius:8px;'
+            f'padding:14px;border:1px solid #2A2E39;border-top:3px solid {top_color};">'
+            f'<p style="color:#787B86;font-size:0.75rem;text-transform:uppercase;'
+            f'letter-spacing:0.8px;margin:0 0 6px 0;">{period_label} ({(cp+1)}{unit})</p>'
+            f'<p style="color:{top_color};font-size:1.1rem;font-weight:700;margin:0 0 2px 0;">'
+            f'{emoji} {top_regime}</p>'
+            f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+            f'font-size:1.3rem;font-weight:700;margin:0;">{top_prob:.1%}</p>'
+            f'</div>'
+        )
+    cards_html += '</div>'
+    st.html(cards_html)
+
+
+# ============================================================================
+# SECTION D.2: Grid/LP Range Projection (Square Root of Time)
+# ============================================================================
+
+def compute_range_projection(model: GaussianHMM, current_regime: int,
+                             last_close: float, horizon: int,
+                             z_score: float, scaler) -> dict:
+    """
+    Proyecta el rango operativo optimo para Grid/LP usando los parametros
+    del regimen actual del HMM.
+
+    Matematica:
+    - mu_regime: media de log-returns del regimen actual (feature 0, escala original)
+    - sigma_regime: desviacion estandar de log-returns del regimen actual
+    - Escalamiento temporal: sigma_H = sigma_1 * sqrt(H) donde H = horizonte en periodos
+    - Upper = last_close * exp(mu_H + z * sigma_H)
+    - Lower = last_close * exp(mu_H - z * sigma_H)
+
+    Los parametros del modelo estan en escala normalizada (RobustScaler),
+    asi que necesitamos invertir la transformacion para obtener valores reales.
+    """
+    # Extraer media y covarianza del regimen actual en escala normalizada
+    mean_scaled = model.means_[current_regime]      # shape (3,)
+    covar_scaled = model.covars_[current_regime]     # shape (3, 3)
+
+    # Invertir escalado para obtener valores en escala original
+    # RobustScaler: x_scaled = (x - median) / IQR => x = x_scaled * IQR + median
+    # scaler.center_ = medians, scaler.scale_ = IQR
+    mu_original = mean_scaled[0] * scaler.scale_[0] + scaler.center_[0]
+    # La varianza escalada se multiplica por IQR^2 para revertir
+    sigma_original = np.sqrt(covar_scaled[0, 0]) * scaler.scale_[0]
+
+    # Escalamiento por raiz cuadrada del tiempo
+    mu_H = mu_original * horizon
+    sigma_H = sigma_original * np.sqrt(horizon)
+
+    # Bandas de confianza en espacio log
+    upper_log = mu_H + z_score * sigma_H
+    lower_log = mu_H - z_score * sigma_H
+
+    # Convertir a precios
+    upper_price = last_close * np.exp(upper_log)
+    lower_price = last_close * np.exp(lower_log)
+    mid_price = last_close * np.exp(mu_H)
+
+    # Amplitud del rango en %
+    amplitude_pct = (upper_price - lower_price) / last_close * 100
+
+    # Generar puntos intermedios para el tunel visual (cada periodo)
+    tunnel_upper = []
+    tunnel_lower = []
+    tunnel_mid = []
+    for h in range(1, horizon + 1):
+        mu_h = mu_original * h
+        sigma_h = sigma_original * np.sqrt(h)
+        tunnel_upper.append(last_close * np.exp(mu_h + z_score * sigma_h))
+        tunnel_lower.append(last_close * np.exp(mu_h - z_score * sigma_h))
+        tunnel_mid.append(last_close * np.exp(mu_h))
+
+    return {
+        "upper": upper_price,
+        "lower": lower_price,
+        "mid": mid_price,
+        "amplitude_pct": amplitude_pct,
+        "mu_original": mu_original,
+        "sigma_original": sigma_original,
+        "sigma_H": sigma_H,
+        "z_score": z_score,
+        "horizon": horizon,
+        "last_close": last_close,
+        "tunnel_upper": tunnel_upper,
+        "tunnel_lower": tunnel_lower,
+        "tunnel_mid": tunnel_mid,
+    }
+
+
+def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
+                               last_date, timeframe: str):
+    """
+    Agrega el tunel de rango proyectado al grafico de velas.
+    Extiende hacia la derecha (futuro) con area sombreada + lineas punteadas.
+    """
+    horizon = range_data["horizon"]
+    tunnel_upper = range_data["tunnel_upper"]
+    tunnel_lower = range_data["tunnel_lower"]
+    tunnel_mid = range_data["tunnel_mid"]
+    last_close = range_data["last_close"]
+
+    # Generar fechas futuras
+    tf_deltas = {
+        "1H": pd.Timedelta(hours=1),
+        "4H": pd.Timedelta(hours=4),
+        "1D": pd.Timedelta(days=1),
+        "1W": pd.Timedelta(weeks=1),
+    }
+    delta = tf_deltas.get(timeframe, pd.Timedelta(days=1))
+    future_dates = [last_date + delta * i for i in range(1, horizon + 1)]
+
+    # Punto de inicio = ultimo cierre
+    all_dates = [last_date] + future_dates
+    all_upper = [last_close] + tunnel_upper
+    all_lower = [last_close] + tunnel_lower
+    all_mid = [last_close] + tunnel_mid
+
+    # Area sombreada (tunel)
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates,
+            y=all_upper,
+            mode="lines",
+            line=dict(color="#FFD54F", width=2, dash="dash"),
+            name=f"Upper ({range_data['z_score']}σ)",
+            showlegend=True,
+            hovertemplate="Upper: $%{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates,
+            y=all_lower,
+            mode="lines",
+            line=dict(color="#FFD54F", width=2, dash="dash"),
+            name=f"Lower ({range_data['z_score']}σ)",
+            fill="tonexty",
+            fillcolor="rgba(255, 213, 79, 0.08)",
+            showlegend=True,
+            hovertemplate="Lower: $%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    # Linea media esperada
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates,
+            y=all_mid,
+            mode="lines",
+            line=dict(color="#FFD54F", width=1, dash="dot"),
+            name="Expected",
+            showlegend=False,
+            hovertemplate="Expected: $%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    # Anotaciones de precio en el extremo derecho
+    last_future = future_dates[-1]
+    fig.add_annotation(
+        x=last_future, y=tunnel_upper[-1],
+        text=f"<b>${tunnel_upper[-1]:,.2f}</b>",
+        showarrow=False,
+        font=dict(size=11, color="#FFD54F"),
+        bgcolor="#131722",
+        xanchor="left", xshift=5,
+    )
+    fig.add_annotation(
+        x=last_future, y=tunnel_lower[-1],
+        text=f"<b>${tunnel_lower[-1]:,.2f}</b>",
+        showarrow=False,
+        font=dict(size=11, color="#FFD54F"),
+        bgcolor="#131722",
+        xanchor="left", xshift=5,
+    )
+
+    return fig
+
+
+def render_range_card(range_data: dict, current_label: str, current_color: str, timeframe: str):
+    """Renderiza la tarjeta de rango proyectado para Grid/LP."""
+    tf_units = {"1H": "hora(s)", "4H": "periodo(s) 4H", "1D": "dia(s)", "1W": "semana(s)"}
+    unit = tf_units.get(timeframe, "periodo(s)")
+
+    upper = range_data["upper"]
+    lower = range_data["lower"]
+    mid = range_data["mid"]
+    amp = range_data["amplitude_pct"]
+    horizon = range_data["horizon"]
+    z = range_data["z_score"]
+    last = range_data["last_close"]
+
+    # Color del rango segun amplitud (verde=estrecho/bueno, amarillo=medio, rojo=amplio)
+    if amp < 5:
+        amp_color = "#4CAF50"
+        amp_label = "Estrecho"
+    elif amp < 15:
+        amp_color = "#FFD54F"
+        amp_label = "Moderado"
+    else:
+        amp_color = "#EF5350"
+        amp_label = "Amplio"
+
+    st.html(
+        f'<div style="background:linear-gradient(135deg,#1E222D 0%,#131722 100%);'
+        f'border-radius:12px;padding:24px 28px;margin-bottom:16px;'
+        f'border:1px solid #2A2E39;border-top:3px solid #FFD54F;'
+        f'box-shadow:0 4px 24px rgba(0,0,0,0.3);">'
+        # Titulo
+        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+        f'<div>'
+        f'<p style="color:#FFD54F;font-size:0.75rem;text-transform:uppercase;'
+        f'letter-spacing:1px;margin:0 0 4px 0;">📐 Rango Proyectado Grid/LP</p>'
+        f'<p style="color:#787B86;font-size:0.8rem;margin:0;">'
+        f'Horizonte: {horizon} {unit} | Z-score: {z}σ | Regimen: {current_label}</p>'
+        f'</div>'
+        f'<div style="text-align:right;">'
+        f'<p style="color:{amp_color};font-size:1.8rem;font-weight:700;'
+        f'font-family:Consolas,Monaco,monospace;margin:0;">{amp:.1f}%</p>'
+        f'<p style="color:#787B86;font-size:0.75rem;margin:0;">Amplitud ({amp_label})</p>'
+        f'</div></div>'
+        # Grid de precios
+        f'<div style="display:flex;gap:16px;flex-wrap:wrap;">'
+        # Upper
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
+        f'padding:12px 16px;border:1px solid #2A2E39;">'
+        f'<p style="color:#EF5350;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 4px 0;">▲ Upper Bound</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.3rem;font-weight:700;margin:0;">${upper:,.2f}</p>'
+        f'<p style="color:#EF5350;font-size:0.8rem;margin:2px 0 0 0;">'
+        f'+{((upper/last)-1)*100:.2f}%</p></div>'
+        # Mid / Expected
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
+        f'padding:12px 16px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 4px 0;">◆ Expected</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.3rem;font-weight:700;margin:0;">${mid:,.2f}</p>'
+        f'<p style="color:#787B86;font-size:0.8rem;margin:2px 0 0 0;">'
+        f'{((mid/last)-1)*100:+.2f}%</p></div>'
+        # Lower
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
+        f'padding:12px 16px;border:1px solid #2A2E39;">'
+        f'<p style="color:#4CAF50;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 4px 0;">▼ Lower Bound</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.3rem;font-weight:700;margin:0;">${lower:,.2f}</p>'
+        f'<p style="color:#4CAF50;font-size:0.8rem;margin:2px 0 0 0;">'
+        f'{((lower/last)-1)*100:.2f}%</p></div>'
+        # Last close
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
+        f'padding:12px 16px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 4px 0;">● Precio Actual</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.3rem;font-weight:700;margin:0;">${last:,.2f}</p>'
+        f'<p style="color:#787B86;font-size:0.8rem;margin:2px 0 0 0;">'
+        f'σ diaria: {range_data["sigma_original"]:.4f}</p></div>'
+        f'</div></div>'
+    )
 
 
 # ============================================================================
@@ -961,70 +1209,61 @@ def plot_transition_heatmap(transition_df: pd.DataFrame) -> go.Figure:
 def render_regime_card(current_label, current_color, ticker, timeframe, regime_means):
     """Renderiza el card principal del regimen actual con HTML custom."""
     emoji = REGIME_EMOJIS.get(current_label, "")
-    st.markdown(
-        f"""
-        <div class="regime-card" style="border-left: 8px solid {current_color};">
-            <h2 style="color: {current_color};">{emoji} {current_label}</h2>
-            <p class="subtitle">{ticker} &mdash; {timeframe} &mdash; Regimen Actual</p>
-            <div class="metrics-row">
-                <div class="metric-item">
-                    <span class="metric-label">Retorno Medio</span>
-                    <span class="metric-value">{regime_means[0]:+.5f}</span>
-                </div>
-                <div class="metric-item">
-                    <span class="metric-label">Volatilidad Media</span>
-                    <span class="metric-value">{regime_means[1]:.5f}</span>
-                </div>
-                <div class="metric-item">
-                    <span class="metric-label">Momentum Medio</span>
-                    <span class="metric-value">{regime_means[2]:+.5f}</span>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.html(
+        f'<div class="regime-card" style="border-left:8px solid {current_color};">'
+        f'<h2 style="color:{current_color};">{emoji} {current_label}</h2>'
+        f'<p class="subtitle">{ticker} &mdash; {timeframe} &mdash; Regimen Actual</p>'
+        f'<div class="metrics-row">'
+        f'<div class="metric-item">'
+        f'<span class="metric-label">Retorno Medio</span>'
+        f'<span class="metric-value">{regime_means[0]:+.5f}</span></div>'
+        f'<div class="metric-item">'
+        f'<span class="metric-label">Volatilidad Media</span>'
+        f'<span class="metric-value">{regime_means[1]:.5f}</span></div>'
+        f'<div class="metric-item">'
+        f'<span class="metric-label">Momentum Medio</span>'
+        f'<span class="metric-value">{regime_means[2]:+.5f}</span></div>'
+        f'</div></div>'
     )
 
 
 def render_transition_probabilities(model, current_regime, label_map, color_map, sorted_order):
     """Renderiza las probabilidades de transicion con barras custom HTML."""
-    st.markdown('<div class="section-title">Probabilidades de Transicion</div>', unsafe_allow_html=True)
+    st.html('<div class="section-title">Probabilidades de Transicion</div>')
 
     current_label = label_map[current_regime]
     emoji = REGIME_EMOJIS.get(current_label, "")
-    st.markdown(
-        f'<p style="color: #787B86; font-size: 0.85rem;">Desde: <b style="color: {color_map[current_regime]};">'
-        f'{emoji} {current_label}</b></p>',
-        unsafe_allow_html=True,
+    st.html(
+        f'<p style="color:#787B86;font-size:0.85rem;">Desde: <b style="color:{color_map[current_regime]};">'
+        f'{emoji} {current_label}</b></p>'
     )
 
     trans_probs = model.transmat_[current_regime]
+    bars_html = ""
     for regime_idx in sorted_order:
         prob = trans_probs[regime_idx]
         label = label_map[regime_idx]
         color = color_map[regime_idx]
         regime_emoji = REGIME_EMOJIS.get(label, "")
-        pct_width = max(prob * 100, 1)  # min 1% para visibilidad
+        pct_width = max(prob * 100, 1)
 
-        st.markdown(
-            f"""
-            <div class="prob-bar-container">
-                <div class="prob-bar-header">
-                    <span class="prob-bar-label" style="color: {color};">{regime_emoji} {label}</span>
-                    <span class="prob-bar-value" style="color: {color};">{prob:.1%}</span>
-                </div>
-                <div class="prob-bar-track">
-                    <div class="prob-bar-fill" style="width: {pct_width}%; background: {color};"></div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        bars_html += (
+            f'<div class="prob-bar-container">'
+            f'<div class="prob-bar-header">'
+            f'<span class="prob-bar-label" style="color:{color};">{regime_emoji} {label}</span>'
+            f'<span class="prob-bar-value" style="color:{color};">{prob:.1%}</span>'
+            f'</div>'
+            f'<div class="prob-bar-track">'
+            f'<div class="prob-bar-fill" style="width:{pct_width}%;background:{color};"></div>'
+            f'</div></div>'
         )
+
+    st.html(bars_html)
 
 
 def render_distribution_badges(regimes, label_map, color_map, sorted_order):
     """Renderiza la distribucion de regimenes como badges."""
-    st.markdown('<div class="section-title">Distribucion de Regimenes</div>', unsafe_allow_html=True)
+    st.html('<div class="section-title">Distribucion de Regimenes</div>')
 
     badges_html = ""
     for regime_idx in sorted_order:
@@ -1035,12 +1274,12 @@ def render_distribution_badges(regimes, label_map, color_map, sorted_order):
         emoji = REGIME_EMOJIS.get(label, "")
         badges_html += (
             f'<span class="dist-badge">'
-            f'<span class="dot" style="background: {color};"></span>'
+            f'<span class="dot" style="background:{color};"></span>'
             f'{emoji} {label}: {pct:.1%} ({count})'
             f'</span>'
         )
 
-    st.markdown(badges_html, unsafe_allow_html=True)
+    st.html(badges_html)
 
 
 def render_transition_table(transition_df):
@@ -1086,7 +1325,7 @@ def render_transition_table(transition_df):
         html += f"<tr>{row_html}</tr>"
 
     html += "</tbody></table></div>"
-    st.markdown(html, unsafe_allow_html=True)
+    st.html(html)
 
 
 # ============================================================================
@@ -1123,17 +1362,16 @@ def main():
     )
 
     # Inyectar CSS TradingView
-    st.markdown(TRADINGVIEW_CSS, unsafe_allow_html=True)
+    st.html(TRADINGVIEW_CSS)
 
     st.title("📡 Radar de Tendencia HMM")
     st.caption("Deteccion de regimenes de mercado con Hidden Markov Models")
 
     # ── Sidebar ──────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown(
-            '<p style="color:#787B86; font-size:0.75rem; letter-spacing:1px; '
-            'text-transform:uppercase; margin-bottom:16px;">Configuracion del Modelo</p>',
-            unsafe_allow_html=True,
+        st.html(
+            '<p style="color:#787B86;font-size:0.75rem;letter-spacing:1px;'
+            'text-transform:uppercase;margin-bottom:16px;">Configuracion del Modelo</p>'
         )
 
         ticker = st.text_input(
@@ -1158,24 +1396,44 @@ def main():
         )
 
         st.divider()
-        st.markdown(
-            '<p style="color:#787B86; font-size:0.75rem; letter-spacing:1px; '
-            'text-transform:uppercase; margin-bottom:8px;">Proyeccion</p>',
-            unsafe_allow_html=True,
+        st.html(
+            '<p style="color:#787B86;font-size:0.75rem;letter-spacing:1px;'
+            'text-transform:uppercase;margin-bottom:8px;">Proyeccion</p>'
         )
 
         n_projection = st.slider(
-            "Periodos hacia adelante",
+            "Periodos hacia adelante (regimenes)",
             min_value=1,
             max_value=30,
             value=10,
             help="Cuantos periodos proyectar usando la matriz de transicion del HMM",
         )
 
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.divider()
+        st.html(
+            '<p style="color:#FFD54F;font-size:0.75rem;letter-spacing:1px;'
+            'text-transform:uppercase;margin-bottom:8px;">📐 Rango Grid / LP</p>'
+        )
+
+        range_horizon = st.number_input(
+            "Horizonte del rango (periodos)",
+            min_value=1,
+            max_value=30,
+            value=7,
+            help="Periodos para proyectar el rango. Ej: 7 en 1D = 1 semana de rango",
+        )
+
+        z_score = st.select_slider(
+            "Z-Score (bandas de confianza)",
+            options=[1.0, 1.5, 2.0, 2.5, 3.0],
+            value=2.0,
+            help="1.5σ = ~87% confianza, 2σ = ~95%, 2.5σ = ~99%",
+        )
+
+        st.html("<br>")
         train_button = st.button("🚀 Entrenar Modelo", use_container_width=True)
 
-        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.html("<br>")
         with st.expander("📐 Explicacion Matematica"):
             st.markdown(MATH_EXPLANATION)
 
@@ -1185,30 +1443,26 @@ def main():
         st.session_state.trained = False
 
     if train_button:
-        _run_pipeline(ticker, timeframe, n_regimes, n_projection)
+        _run_pipeline(ticker, timeframe, n_regimes, n_projection, range_horizon, z_score)
 
     if st.session_state.trained:
         _display_results()
     else:
         # Welcome screen
-        st.markdown(
-            """
-            <div style="text-align:center; padding:80px 20px;">
-                <p style="font-size:4rem; margin-bottom:16px;">📡</p>
-                <h2 style="color:#D1D4DC; margin-bottom:8px;">Radar de Tendencia</h2>
-                <p style="color:#787B86; font-size:1.1rem; max-width:500px; margin:0 auto;">
-                    Configura los parametros en el panel lateral y presiona
-                    <b style="color:#2962FF;">Entrenar Modelo</b> para detectar
-                    regimenes de mercado con HMM.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        st.html(
+            '<div style="text-align:center;padding:80px 20px;">'
+            '<p style="font-size:4rem;margin-bottom:16px;">📡</p>'
+            '<h2 style="color:#D1D4DC;margin-bottom:8px;">Radar de Tendencia</h2>'
+            '<p style="color:#787B86;font-size:1.1rem;max-width:500px;margin:0 auto;">'
+            'Configura los parametros en el panel lateral y presiona '
+            '<b style="color:#2962FF;">Entrenar Modelo</b> para detectar '
+            'regimenes de mercado con HMM.</p></div>'
         )
 
 
-def _run_pipeline(ticker: str, timeframe: str, n_regimes: int, n_projection: int = 10):
-    """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project."""
+def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
+                  n_projection: int = 10, range_horizon: int = 7, z_score: float = 2.0):
+    """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project -> range."""
     config = TIMEFRAME_CONFIG[timeframe]
 
     with st.spinner(f"Obteniendo datos para {ticker} ({timeframe})..."):
@@ -1260,6 +1514,9 @@ def _run_pipeline(ticker: str, timeframe: str, n_regimes: int, n_projection: int
     st.session_state.timeframe = timeframe
     st.session_state.n_regimes = n_regimes
     st.session_state.n_projection = n_projection
+    st.session_state.range_horizon = range_horizon
+    st.session_state.z_score = z_score
+    st.session_state.scaler = scaler
     st.session_state.converged = converged
     st.session_state.trained = True
 
@@ -1281,14 +1538,28 @@ def _display_results():
     current_label = label_map[current_regime]
     current_color = color_map[current_regime]
     regime_means = model.means_[current_regime]
+    scaler = st.session_state.scaler
+    range_horizon = st.session_state.get("range_horizon", 7)
+    z_score = st.session_state.get("z_score", 2.0)
 
     # ── 1. Card de regimen actual (full width, grande) ────────────────
     render_regime_card(current_label, current_color, ticker, timeframe, regime_means)
 
-    # ── 2. Grafico de velas (full width, grande) ─────────────────────
+    # ── 1.5 Calculo y Card de Rango Grid/LP ──────────────────────────
+    last_close = float(df["Close"].squeeze().iloc[-1])
+    range_data = compute_range_projection(
+        model, current_regime, last_close, range_horizon, z_score, scaler
+    )
+    render_range_card(range_data, current_label, current_color, timeframe)
+
+    # ── 2. Grafico de velas + tunel de rango (full width, grande) ────
     fig_candle = plot_candlestick_with_regimes(
         df, regimes, label_map, color_map, features.index
     )
+    # Agregar tunel de rango proyectado al chart
+    last_date = features.index[-1]
+    add_range_tunnel_to_chart(fig_candle, range_data, last_date, timeframe)
+
     st.plotly_chart(fig_candle, use_container_width=True, config={
         "displayModeBar": True,
         "modeBarButtonsToRemove": ["autoScale2d", "lasso2d", "select2d"],
@@ -1306,23 +1577,22 @@ def _display_results():
     with col_dist:
         render_distribution_badges(regimes, label_map, color_map, sorted_order)
 
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.html("<br>")
 
         # Info de barras analizadas
-        st.markdown(
-            f'<div style="background:#1E222D; border-radius:8px; padding:12px 16px; '
-            f'border:1px solid #2A2E39; margin-top:8px;">'
-            f'<span style="color:#787B86; font-size:0.8rem; text-transform:uppercase; '
+        st.html(
+            f'<div style="background:#1E222D;border-radius:8px;padding:12px 16px;'
+            f'border:1px solid #2A2E39;margin-top:8px;">'
+            f'<span style="color:#787B86;font-size:0.8rem;text-transform:uppercase;'
             f'letter-spacing:0.5px;">Barras Analizadas</span><br>'
-            f'<span style="color:#D1D4DC; font-family:Consolas,Monaco,monospace; '
-            f'font-size:1.4rem; font-weight:700;">{len(regimes):,}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
+            f'<span style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+            f'font-size:1.4rem;font-weight:700;">{len(regimes):,}</span>'
+            f'</div>'
         )
 
     # ── 4. Proyeccion de regimenes hacia adelante ──────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="section-title">🔮 Proyeccion de Regimenes</div>', unsafe_allow_html=True)
+    st.html("<br>")
+    st.html('<div class="section-title">🔮 Proyeccion de Regimenes</div>')
 
     n_projection = st.session_state.get("n_projection", 10)
     proj_df = project_regimes(model, current_regime, n_projection, label_map, color_map, sorted_order)
@@ -1330,15 +1600,15 @@ def _display_results():
     # Resumen: regimen mas probable en checkpoints clave
     render_projection_summary(proj_df, color_map, label_map, sorted_order, n_projection, timeframe)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.html("<br>")
 
     # Grafico de area apilada con evolucion de probabilidades
     fig_proj = plot_projection(proj_df, color_map, label_map, sorted_order, timeframe)
     st.plotly_chart(fig_proj, use_container_width=True, config={"displaylogo": False})
 
     # ── 5. Matriz de transicion ──────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Matriz de Transicion</div>', unsafe_allow_html=True)
+    st.html("<br>")
+    st.html('<div class="section-title">Matriz de Transicion</div>')
 
     col_heatmap, col_table = st.columns([3, 2])
 
@@ -1347,10 +1617,7 @@ def _display_results():
         st.plotly_chart(fig_heatmap, use_container_width=True, config={"displaylogo": False})
 
     with col_table:
-        st.markdown(
-            '<p style="color:#787B86; font-size:0.8rem; margin-bottom:8px;">Valores numericos:</p>',
-            unsafe_allow_html=True,
-        )
+        st.html('<p style="color:#787B86;font-size:0.8rem;margin-bottom:8px;">Valores numericos:</p>')
         render_transition_table(transition_df)
 
     # ── 6. Features plot (debug) ─────────────────────────────────────
