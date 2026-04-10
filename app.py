@@ -631,6 +631,13 @@ def project_regimes(model: GaussianHMM, current_regime: int, n_periods: int,
     return df_proj
 
 
+def _hex_to_rgba(hex_color: str, alpha: float = 0.4) -> str:
+    """Convierte color hex (#RRGGBB) a rgba() string para Plotly."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 def plot_projection(proj_df: pd.DataFrame, color_map: dict, label_map: dict,
                     sorted_order, timeframe: str) -> go.Figure:
     """
@@ -655,8 +662,7 @@ def plot_projection(proj_df: pd.DataFrame, color_map: dict, label_map: dict,
                 mode="lines",
                 line=dict(width=0.5, color=color),
                 stackgroup="one",
-                fillcolor=color.replace(")", ",0.6)").replace("rgb", "rgba")
-                    if "rgb" in color else color + "99",
+                fillcolor=_hex_to_rgba(color, 0.4),
                 hovertemplate=f"{label}: " + "%{y:.1%}<extra></extra>",
             )
         )
