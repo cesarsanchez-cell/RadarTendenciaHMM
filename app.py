@@ -811,91 +811,173 @@ def render_projection_summary(proj_df: pd.DataFrame, color_map: dict, label_map:
 
 
 # ============================================================================
-# SECTION D.2: Grid/LP Range Projection (Square Root of Time)
+# SECTION D.2: Monte Carlo Regime-Switching Range Projection
 # ============================================================================
+
+def _extract_regime_params(model: GaussianHMM, scaler):
+    """
+    Extrae mu y sigma de log-returns (feature 0) de cada regimen
+    en escala original (invierte el RobustScaler).
+    Returns: dict[regime_idx] -> (mu, sigma)
+    """
+    params = {}
+    for k in range(model.n_components):
+        mu_scaled = model.means_[k, 0]
+        var_scaled = model.covars_[k][0, 0]
+        # Invertir: x = x_scaled * IQR + median
+        mu_orig = mu_scaled * scaler.scale_[0] + scaler.center_[0]
+        sigma_orig = np.sqrt(var_scaled) * scaler.scale_[0]
+        params[k] = (mu_orig, sigma_orig)
+    return params
+
 
 def compute_range_projection(model: GaussianHMM, current_regime: int,
                              last_close: float, horizon: int,
-                             z_score: float, scaler) -> dict:
+                             z_score: float, scaler,
+                             n_simulations: int = 10000) -> dict:
     """
-    Proyecta el rango operativo optimo para Grid/LP usando los parametros
-    del regimen actual del HMM.
+    Monte Carlo Regime-Switching: simula N trayectorias de precio donde
+    en cada paso temporal:
+      1. El regimen puede cambiar segun la matriz de transicion
+      2. El retorno se samplea de la distribucion del regimen activo
 
-    Matematica:
-    - mu_regime: media de log-returns del regimen actual (feature 0, escala original)
-    - sigma_regime: desviacion estandar de log-returns del regimen actual
-    - Escalamiento temporal: sigma_H = sigma_1 * sqrt(H) donde H = horizonte en periodos
-    - Upper = last_close * exp(mu_H + z * sigma_H)
-    - Lower = last_close * exp(mu_H - z * sigma_H)
+    Esto produce rangos ASIMETRICOS y sesgados por la dinamica real
+    de los regimenes (bear sesga abajo, bull sesga arriba).
 
-    Los parametros del modelo estan en escala normalizada (RobustScaler),
-    asi que necesitamos invertir la transformacion para obtener valores reales.
+    Returns dict con percentiles, tunnel por periodo, y estadisticas.
     """
-    # Extraer media y covarianza del regimen actual en escala normalizada
-    mean_scaled = model.means_[current_regime]      # shape (3,)
-    covar_scaled = model.covars_[current_regime]     # shape (3, 3)
+    transmat = model.transmat_
+    regime_params = _extract_regime_params(model, scaler)
+    n_regimes = model.n_components
 
-    # Invertir escalado para obtener valores en escala original
-    # RobustScaler: x_scaled = (x - median) / IQR => x = x_scaled * IQR + median
-    # scaler.center_ = medians, scaler.scale_ = IQR
-    mu_original = mean_scaled[0] * scaler.scale_[0] + scaler.center_[0]
-    # La varianza escalada se multiplica por IQR^2 para revertir
-    sigma_original = np.sqrt(covar_scaled[0, 0]) * scaler.scale_[0]
+    # Pre-computar CDF acumulada de transicion para sampling rapido
+    cum_transmat = np.cumsum(transmat, axis=1)
 
-    # Escalamiento por raiz cuadrada del tiempo
-    mu_H = mu_original * horizon
-    sigma_H = sigma_original * np.sqrt(horizon)
+    # Matrices para almacenar resultados
+    # prices[sim, step] = precio en ese paso de esa simulacion
+    # regimes_sim[sim, step] = regimen activo
+    prices = np.zeros((n_simulations, horizon + 1))
+    prices[:, 0] = last_close
 
-    # Bandas de confianza en espacio log
-    upper_log = mu_H + z_score * sigma_H
-    lower_log = mu_H - z_score * sigma_H
+    # Estado inicial: todos arrancan en el regimen actual
+    current_regimes = np.full(n_simulations, current_regime, dtype=int)
 
-    # Convertir a precios
-    upper_price = last_close * np.exp(upper_log)
-    lower_price = last_close * np.exp(lower_log)
-    mid_price = last_close * np.exp(mu_H)
+    # Random numbers pre-generados para velocidad
+    rng = np.random.default_rng(seed=42)
+    uniform_transitions = rng.random((n_simulations, horizon))
+    uniform_returns = rng.standard_normal((n_simulations, horizon))
 
-    # Amplitud del rango en %
-    amplitude_pct = (upper_price - lower_price) / last_close * 100
+    # Almacenar regimenes por paso para estadisticas
+    regime_counts_per_step = np.zeros((horizon, n_regimes))
 
-    # Generar puntos intermedios para el tunel visual (cada periodo)
+    for t in range(horizon):
+        # 1. Transicion de regimen para cada simulacion
+        for sim in range(n_simulations):
+            u = uniform_transitions[sim, t]
+            cum_probs = cum_transmat[current_regimes[sim]]
+            new_regime = np.searchsorted(cum_probs, u)
+            new_regime = min(new_regime, n_regimes - 1)
+            current_regimes[sim] = new_regime
+
+        # Contar regimenes en este paso
+        for k in range(n_regimes):
+            regime_counts_per_step[t, k] = np.sum(current_regimes == k)
+
+        # 2. Samplear retorno del regimen activo de cada simulacion
+        for k in range(n_regimes):
+            mask = current_regimes == k
+            count = np.sum(mask)
+            if count == 0:
+                continue
+            mu_k, sigma_k = regime_params[k]
+            # r = mu + sigma * Z
+            returns_k = mu_k + sigma_k * uniform_returns[mask, t]
+            prices[mask, t + 1] = prices[mask, t] * np.exp(returns_k)
+
+    # ── Calcular percentiles por paso ──
+    # Convertir z_score a percentiles
+    # z=1.5 -> p5/p95 (~90% CI), z=2.0 -> p2.5/p97.5 (~95% CI)
+    from scipy.stats import norm
+    lower_pct = (1 - norm.cdf(z_score)) * 100    # ej: 2.28 para z=2
+    upper_pct = norm.cdf(z_score) * 100           # ej: 97.72 para z=2
+
     tunnel_upper = []
     tunnel_lower = []
-    tunnel_mid = []
-    for h in range(1, horizon + 1):
-        mu_h = mu_original * h
-        sigma_h = sigma_original * np.sqrt(h)
-        tunnel_upper.append(last_close * np.exp(mu_h + z_score * sigma_h))
-        tunnel_lower.append(last_close * np.exp(mu_h - z_score * sigma_h))
-        tunnel_mid.append(last_close * np.exp(mu_h))
+    tunnel_mid = []        # mediana (p50)
+    tunnel_expected = []   # media
+    tunnel_p25 = []
+    tunnel_p75 = []
+
+    for t in range(1, horizon + 1):
+        step_prices = prices[:, t]
+        tunnel_lower.append(float(np.percentile(step_prices, lower_pct)))
+        tunnel_p25.append(float(np.percentile(step_prices, 25)))
+        tunnel_mid.append(float(np.percentile(step_prices, 50)))
+        tunnel_p75.append(float(np.percentile(step_prices, 75)))
+        tunnel_upper.append(float(np.percentile(step_prices, upper_pct)))
+        tunnel_expected.append(float(np.mean(step_prices)))
+
+    # Precios finales
+    final_prices = prices[:, -1]
+    upper_price = float(np.percentile(final_prices, upper_pct))
+    lower_price = float(np.percentile(final_prices, lower_pct))
+    mid_price = float(np.median(final_prices))
+    expected_price = float(np.mean(final_prices))
+    amplitude_pct = (upper_price - lower_price) / last_close * 100
+
+    # Sesgo: que tan asimetrico es el rango
+    upside = (upper_price - last_close) / last_close * 100
+    downside = (last_close - lower_price) / last_close * 100
+    skew_ratio = upside / downside if downside > 0 else float('inf')
+
+    # Probabilidades direccionales
+    prob_up = float(np.mean(final_prices > last_close)) * 100
+    prob_down = float(np.mean(final_prices < last_close)) * 100
+
+    # IQR range (50% de las trayectorias)
+    iqr_upper = float(np.percentile(final_prices, 75))
+    iqr_lower = float(np.percentile(final_prices, 25))
+    iqr_amplitude = (iqr_upper - iqr_lower) / last_close * 100
+
+    # Regimen dominante promedio
+    regime_probs_avg = regime_counts_per_step.mean(axis=0) / n_simulations
 
     return {
         "upper": upper_price,
         "lower": lower_price,
         "mid": mid_price,
+        "expected": expected_price,
         "amplitude_pct": amplitude_pct,
-        "mu_original": mu_original,
-        "sigma_original": sigma_original,
-        "sigma_H": sigma_H,
+        "upside_pct": upside,
+        "downside_pct": downside,
+        "skew_ratio": skew_ratio,
+        "prob_up": prob_up,
+        "prob_down": prob_down,
+        "iqr_upper": iqr_upper,
+        "iqr_lower": iqr_lower,
+        "iqr_amplitude": iqr_amplitude,
         "z_score": z_score,
         "horizon": horizon,
         "last_close": last_close,
+        "n_simulations": n_simulations,
         "tunnel_upper": tunnel_upper,
         "tunnel_lower": tunnel_lower,
         "tunnel_mid": tunnel_mid,
+        "tunnel_expected": tunnel_expected,
+        "tunnel_p25": tunnel_p25,
+        "tunnel_p75": tunnel_p75,
+        "regime_probs_avg": regime_probs_avg,
     }
 
 
 def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
                                last_date, timeframe: str):
     """
-    Agrega el tunel de rango proyectado al grafico de velas.
-    Extiende hacia la derecha (futuro) con area sombreada + lineas punteadas.
+    Agrega el tunel Monte Carlo al grafico de velas.
+    Muestra 2 zonas: IQR (50% trayectorias) + banda completa (z-score).
+    La mediana muestra hacia donde sesga el modelo.
     """
     horizon = range_data["horizon"]
-    tunnel_upper = range_data["tunnel_upper"]
-    tunnel_lower = range_data["tunnel_lower"]
-    tunnel_mid = range_data["tunnel_mid"]
     last_close = range_data["last_close"]
 
     # Generar fechas futuras
@@ -908,153 +990,212 @@ def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
     delta = tf_deltas.get(timeframe, pd.Timedelta(days=1))
     future_dates = [last_date + delta * i for i in range(1, horizon + 1)]
 
-    # Punto de inicio = ultimo cierre
     all_dates = [last_date] + future_dates
-    all_upper = [last_close] + tunnel_upper
-    all_lower = [last_close] + tunnel_lower
-    all_mid = [last_close] + tunnel_mid
+    all_upper = [last_close] + range_data["tunnel_upper"]
+    all_lower = [last_close] + range_data["tunnel_lower"]
+    all_p75 = [last_close] + range_data["tunnel_p75"]
+    all_p25 = [last_close] + range_data["tunnel_p25"]
+    all_mid = [last_close] + range_data["tunnel_mid"]
 
-    # Area sombreada (tunel)
+    # Banda exterior (z-score CI)
     fig.add_trace(
         go.Scatter(
-            x=all_dates,
-            y=all_upper,
-            mode="lines",
-            line=dict(color="#FFD54F", width=2, dash="dash"),
-            name=f"Upper ({range_data['z_score']}σ)",
+            x=all_dates, y=all_upper, mode="lines",
+            line=dict(color="#FFD54F", width=1.5, dash="dash"),
+            name=f"P{100-range_data['z_score']*100/2:.0f} Upper",
             showlegend=True,
             hovertemplate="Upper: $%{y:,.2f}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=all_dates,
-            y=all_lower,
-            mode="lines",
-            line=dict(color="#FFD54F", width=2, dash="dash"),
-            name=f"Lower ({range_data['z_score']}σ)",
+            x=all_dates, y=all_lower, mode="lines",
+            line=dict(color="#FFD54F", width=1.5, dash="dash"),
+            name=f"P{range_data['z_score']*100/2:.0f} Lower",
             fill="tonexty",
-            fillcolor="rgba(255, 213, 79, 0.08)",
+            fillcolor="rgba(255, 213, 79, 0.06)",
             showlegend=True,
             hovertemplate="Lower: $%{y:,.2f}<extra></extra>",
         )
     )
 
-    # Linea media esperada
+    # Banda interior IQR (P25-P75, donde caen 50% de las simulaciones)
     fig.add_trace(
         go.Scatter(
-            x=all_dates,
-            y=all_mid,
-            mode="lines",
-            line=dict(color="#FFD54F", width=1, dash="dot"),
-            name="Expected",
-            showlegend=False,
-            hovertemplate="Expected: $%{y:,.2f}<extra></extra>",
+            x=all_dates, y=all_p75, mode="lines",
+            line=dict(color="#42A5F5", width=1.5),
+            name="P75 (IQR)",
+            showlegend=True,
+            hovertemplate="P75: $%{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates, y=all_p25, mode="lines",
+            line=dict(color="#42A5F5", width=1.5),
+            name="P25 (IQR)",
+            fill="tonexty",
+            fillcolor="rgba(66, 165, 245, 0.12)",
+            showlegend=True,
+            hovertemplate="P25: $%{y:,.2f}<extra></extra>",
         )
     )
 
-    # Anotaciones de precio en el extremo derecho
+    # Mediana (hacia donde sesga el modelo)
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates, y=all_mid, mode="lines",
+            line=dict(color="#FFFFFF", width=2),
+            name="Mediana (P50)",
+            showlegend=True,
+            hovertemplate="Mediana: $%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    # Anotaciones en el extremo derecho
     last_future = future_dates[-1]
-    fig.add_annotation(
-        x=last_future, y=tunnel_upper[-1],
-        text=f"<b>${tunnel_upper[-1]:,.2f}</b>",
-        showarrow=False,
-        font=dict(size=11, color="#FFD54F"),
-        bgcolor="#131722",
-        xanchor="left", xshift=5,
-    )
-    fig.add_annotation(
-        x=last_future, y=tunnel_lower[-1],
-        text=f"<b>${tunnel_lower[-1]:,.2f}</b>",
-        showarrow=False,
-        font=dict(size=11, color="#FFD54F"),
-        bgcolor="#131722",
-        xanchor="left", xshift=5,
-    )
+    annotations = [
+        (range_data["tunnel_upper"][-1], "#FFD54F", "left"),
+        (range_data["tunnel_p75"][-1], "#42A5F5", "left"),
+        (range_data["tunnel_mid"][-1], "#FFFFFF", "left"),
+        (range_data["tunnel_p25"][-1], "#42A5F5", "left"),
+        (range_data["tunnel_lower"][-1], "#FFD54F", "left"),
+    ]
+    for price, color, anchor in annotations:
+        fig.add_annotation(
+            x=last_future, y=price,
+            text=f"<b>${price:,.0f}</b>",
+            showarrow=False,
+            font=dict(size=10, color=color),
+            bgcolor="#131722",
+            xanchor=anchor, xshift=8,
+        )
 
     return fig
 
 
 def render_range_card(range_data: dict, current_label: str, current_color: str, timeframe: str):
-    """Renderiza la tarjeta de rango proyectado para Grid/LP."""
+    """Renderiza la tarjeta de rango Monte Carlo para Grid/LP."""
     tf_units = {"1H": "hora(s)", "4H": "periodo(s) 4H", "1D": "dia(s)", "1W": "semana(s)"}
     unit = tf_units.get(timeframe, "periodo(s)")
 
     upper = range_data["upper"]
     lower = range_data["lower"]
     mid = range_data["mid"]
+    expected = range_data["expected"]
     amp = range_data["amplitude_pct"]
+    iqr_amp = range_data["iqr_amplitude"]
+    iqr_upper = range_data["iqr_upper"]
+    iqr_lower = range_data["iqr_lower"]
     horizon = range_data["horizon"]
     z = range_data["z_score"]
     last = range_data["last_close"]
+    prob_up = range_data["prob_up"]
+    prob_down = range_data["prob_down"]
+    skew = range_data["skew_ratio"]
+    n_sim = range_data["n_simulations"]
 
-    # Color del rango segun amplitud (verde=estrecho/bueno, amarillo=medio, rojo=amplio)
-    if amp < 5:
-        amp_color = "#4CAF50"
-        amp_label = "Estrecho"
-    elif amp < 15:
-        amp_color = "#FFD54F"
-        amp_label = "Moderado"
+    # Sesgo direccional
+    if prob_up > 60:
+        bias_color = "#4CAF50"
+        bias_label = "Sesgo Alcista"
+        bias_arrow = "↗"
+    elif prob_down > 60:
+        bias_color = "#EF5350"
+        bias_label = "Sesgo Bajista"
+        bias_arrow = "↘"
     else:
-        amp_color = "#EF5350"
-        amp_label = "Amplio"
+        bias_color = "#FFD54F"
+        bias_label = "Sin Sesgo Claro"
+        bias_arrow = "↔"
+
+    # Amplitud IQR (rango operativo real)
+    if iqr_amp < 5:
+        iqr_color = "#4CAF50"
+        iqr_label = "Estrecho"
+    elif iqr_amp < 15:
+        iqr_color = "#FFD54F"
+        iqr_label = "Moderado"
+    else:
+        iqr_color = "#EF5350"
+        iqr_label = "Amplio"
 
     st.html(
         f'<div style="background:linear-gradient(135deg,#1E222D 0%,#131722 100%);'
         f'border-radius:12px;padding:24px 28px;margin-bottom:16px;'
         f'border:1px solid #2A2E39;border-top:3px solid #FFD54F;'
         f'box-shadow:0 4px 24px rgba(0,0,0,0.3);">'
-        # Titulo
-        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+        # Header
+        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;flex-wrap:wrap;gap:12px;">'
         f'<div>'
         f'<p style="color:#FFD54F;font-size:0.75rem;text-transform:uppercase;'
-        f'letter-spacing:1px;margin:0 0 4px 0;">📐 Rango Proyectado Grid/LP</p>'
+        f'letter-spacing:1px;margin:0 0 4px 0;">📐 Monte Carlo Regime-Switching ({n_sim:,} sims)</p>'
         f'<p style="color:#787B86;font-size:0.8rem;margin:0;">'
-        f'Horizonte: {horizon} {unit} | Z-score: {z}σ | Regimen: {current_label}</p>'
+        f'Horizonte: {horizon} {unit} | Regimen: {current_label}</p>'
         f'</div>'
-        f'<div style="text-align:right;">'
-        f'<p style="color:{amp_color};font-size:1.8rem;font-weight:700;'
-        f'font-family:Consolas,Monaco,monospace;margin:0;">{amp:.1f}%</p>'
-        f'<p style="color:#787B86;font-size:0.75rem;margin:0;">Amplitud ({amp_label})</p>'
+        # Probabilidad direccional
+        f'<div style="display:flex;gap:16px;align-items:center;">'
+        f'<div style="text-align:center;">'
+        f'<p style="color:{bias_color};font-size:1.6rem;font-weight:700;'
+        f'font-family:Consolas,Monaco,monospace;margin:0;">{bias_arrow} {prob_up:.0f}%↑ / {prob_down:.0f}%↓</p>'
+        f'<p style="color:{bias_color};font-size:0.7rem;margin:0;">{bias_label}</p>'
+        f'</div></div></div>'
+        # Rango IQR (operativo) + Rango completo
+        f'<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">'
+        # IQR Box
+        f'<div style="flex:1;min-width:200px;background:#131722;border-radius:8px;'
+        f'padding:14px 16px;border:1px solid #42A5F5;">'
+        f'<p style="color:#42A5F5;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango Operativo (50% prob)</p>'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        f'<span style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.2rem;font-weight:700;">${iqr_lower:,.2f} — ${iqr_upper:,.2f}</span>'
+        f'<span style="color:{iqr_color};font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;">{iqr_amp:.1f}%</span>'
         f'</div></div>'
-        # Grid de precios
-        f'<div style="display:flex;gap:16px;flex-wrap:wrap;">'
-        # Upper
-        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
-        f'padding:12px 16px;border:1px solid #2A2E39;">'
-        f'<p style="color:#EF5350;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 4px 0;">▲ Upper Bound</p>'
-        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.3rem;font-weight:700;margin:0;">${upper:,.2f}</p>'
-        f'<p style="color:#EF5350;font-size:0.8rem;margin:2px 0 0 0;">'
-        f'+{((upper/last)-1)*100:.2f}%</p></div>'
-        # Mid / Expected
-        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
-        f'padding:12px 16px;border:1px solid #2A2E39;">'
-        f'<p style="color:#787B86;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 4px 0;">◆ Expected</p>'
-        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.3rem;font-weight:700;margin:0;">${mid:,.2f}</p>'
-        f'<p style="color:#787B86;font-size:0.8rem;margin:2px 0 0 0;">'
+        # Full range Box
+        f'<div style="flex:1;min-width:200px;background:#131722;border-radius:8px;'
+        f'padding:14px 16px;border:1px solid #FFD54F44;">'
+        f'<p style="color:#FFD54F;font-size:0.7rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango Extremo (~{100-2*(100-prob_up if prob_up>50 else prob_up):.0f}% prob)</p>'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        f'<span style="color:#787B86;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.2rem;">${lower:,.2f} — ${upper:,.2f}</span>'
+        f'<span style="color:#787B86;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;">{amp:.1f}%</span>'
+        f'</div></div></div>'
+        # Grid de precios detallado
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;">'
+        # Mediana
+        f'<div style="flex:1;min-width:110px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#FFFFFF;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Mediana (P50)</p>'
+        f'<p style="color:#FFFFFF;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">${mid:,.2f}</p>'
+        f'<p style="color:#787B86;font-size:0.75rem;margin:2px 0 0 0;">'
         f'{((mid/last)-1)*100:+.2f}%</p></div>'
-        # Lower
-        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
-        f'padding:12px 16px;border:1px solid #2A2E39;">'
-        f'<p style="color:#4CAF50;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 4px 0;">▼ Lower Bound</p>'
+        # Upside
+        f'<div style="flex:1;min-width:110px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#EF5350;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Upside max</p>'
         f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.3rem;font-weight:700;margin:0;">${lower:,.2f}</p>'
-        f'<p style="color:#4CAF50;font-size:0.8rem;margin:2px 0 0 0;">'
-        f'{((lower/last)-1)*100:.2f}%</p></div>'
-        # Last close
-        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
-        f'padding:12px 16px;border:1px solid #2A2E39;">'
-        f'<p style="color:#787B86;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 4px 0;">● Precio Actual</p>'
+        f'font-size:1.1rem;font-weight:700;margin:0;">+{range_data["upside_pct"]:.1f}%</p></div>'
+        # Downside
+        f'<div style="flex:1;min-width:110px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#4CAF50;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Downside max</p>'
         f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.3rem;font-weight:700;margin:0;">${last:,.2f}</p>'
-        f'<p style="color:#787B86;font-size:0.8rem;margin:2px 0 0 0;">'
-        f'σ diaria: {range_data["sigma_original"]:.4f}</p></div>'
+        f'font-size:1.1rem;font-weight:700;margin:0;">-{range_data["downside_pct"]:.1f}%</p></div>'
+        # Precio actual
+        f'<div style="flex:1;min-width:110px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Precio Actual</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">${last:,.2f}</p></div>'
         f'</div></div>'
     )
 
