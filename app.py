@@ -372,11 +372,74 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return resampled
 
 
+def normalize_ticker(ticker: str) -> str:
+    """
+    Normaliza el ticker para evitar errores comunes:
+    - Elimina espacios: 'btc / usdt' -> 'BTC/USDT'
+    - Uppercase: 'btc/usdt' -> 'BTC/USDT'
+    - Detecta pares sin '/' y los corrige: 'BTCUSDT' -> 'BTC/USDT'
+    """
+    ticker = ticker.strip().upper().replace(" ", "")
+
+    # Si tiene '/' ya esta bien, solo limpiar
+    if "/" in ticker:
+        parts = ticker.split("/")
+        return parts[0].strip() + "/" + parts[1].strip()
+
+    # Detectar pares crypto sin '/' (ej: BTCUSDT, ETHUSDT)
+    quote_currencies = ["USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB"]
+    for quote in quote_currencies:
+        if ticker.endswith(quote) and len(ticker) > len(quote):
+            base = ticker[:-len(quote)]
+            return base + "/" + quote
+
+    # No es crypto, devolver como esta (accion/indice)
+    return ticker
+
+
+def search_similar_pairs(query: str, max_results: int = 10) -> list:
+    """
+    Busca pares en Binance que coincidan parcialmente con el query.
+    Retorna lista de simbolos similares.
+    """
+    import ccxt
+    try:
+        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange.load_markets()
+        query_upper = query.upper().replace(" ", "").replace("/", "")
+
+        matches = []
+        for symbol in exchange.symbols:
+            symbol_clean = symbol.replace("/", "")
+            # Match parcial: el query esta contenido en el simbolo
+            if query_upper in symbol_clean:
+                matches.append(symbol)
+            # O la base del par coincide
+            elif symbol.split("/")[0] == query_upper:
+                matches.append(symbol)
+
+        # Priorizar pares USDT, luego USDC, luego otros
+        def sort_key(s):
+            if s.endswith("/USDT"):
+                return (0, s)
+            elif s.endswith("/USDC"):
+                return (1, s)
+            else:
+                return (2, s)
+
+        matches.sort(key=sort_key)
+        return matches[:max_results]
+    except Exception:
+        return []
+
+
 def fetch_data(ticker: str, timeframe: str) -> pd.DataFrame:
     """
     Obtiene datos OHLCV. Detecta si es crypto (contiene '/') para usar ccxt,
     sino usa yfinance. Aplica resample si el timeframe lo requiere.
+    Normaliza el ticker automaticamente.
     """
+    ticker = normalize_ticker(ticker)
     config = TIMEFRAME_CONFIG[timeframe]
     is_crypto = "/" in ticker
 
@@ -1380,11 +1443,63 @@ def main():
             'text-transform:uppercase;margin-bottom:16px;">Configuracion del Modelo</p>'
         )
 
-        ticker = st.text_input(
-            "Ticker / Simbolo",
-            value="SPY",
-            help="Acciones: SPY, AAPL, MSFT | Crypto: BTC/USDT, ETH/USDT",
+        # Pares populares para selector rapido
+        POPULAR_CRYPTO = [
+            "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+            "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "DOT/USDT", "LINK/USDT",
+            "MATIC/USDT", "UNI/USDT", "AAVE/USDT", "ARB/USDT", "OP/USDT",
+        ]
+        POPULAR_STOCKS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+
+        asset_type = st.radio(
+            "Tipo de activo",
+            ["Crypto", "Acciones/Indices"],
+            horizontal=True,
         )
+
+        if asset_type == "Crypto":
+            col_select, col_custom = st.columns([2, 1])
+            with col_select:
+                ticker = st.selectbox(
+                    "Par (populares)",
+                    options=POPULAR_CRYPTO,
+                    index=0,
+                    help="Selecciona un par popular o escribe uno custom",
+                )
+            with col_custom:
+                custom_ticker = st.text_input(
+                    "Custom",
+                    value="",
+                    placeholder="ej: PEPE/USDT",
+                    help="Escribe cualquier par. Se normaliza automaticamente",
+                )
+            if custom_ticker.strip():
+                ticker = normalize_ticker(custom_ticker)
+
+            # Buscar pares similares si el custom no esta vacio
+            if custom_ticker.strip() and "/" not in custom_ticker and len(custom_ticker) >= 2:
+                with st.spinner("Buscando pares..."):
+                    similar = search_similar_pairs(custom_ticker)
+                if similar:
+                    ticker = st.selectbox(
+                        "Pares encontrados",
+                        options=similar,
+                        index=0,
+                    )
+        else:
+            ticker = st.selectbox(
+                "Ticker",
+                options=POPULAR_STOCKS,
+                index=0,
+                help="Selecciona un ticker o escribe uno custom abajo",
+            )
+            custom_stock = st.text_input(
+                "Custom ticker",
+                value="",
+                placeholder="ej: META, AMD",
+            )
+            if custom_stock.strip():
+                ticker = custom_stock.strip().upper()
 
         timeframe = st.selectbox(
             "Timeframe",
