@@ -1300,41 +1300,47 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         strategy_color = "#42A5F5"
         strategy_icon = "📊"
         reason = "Rango moderado + sin tendencia = cada rebote es profit"
-        levels = max(8, min(20, int(op80_amp / 1.5)))
-        spacing = op80_amp / levels
+        levels = max(50, min(100, int(op80_amp / 0.15)))
+        spacing_pct = op80_amp / levels
+        spacing_usd = (op80_upper - op80_lower) / levels
+        profit_per_grid = spacing_pct - 0.1  # descontando fee Pionex ~0.05% x2
         details = (
-            f"Grid de {levels} niveles entre [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
-            f"Spacing: ~{spacing:.1f}% entre niveles. "
-            f"Centrado en precio actual (${last:,.0f})."
+            f"Grid de {levels} grillas entre [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%) entre niveles. "
+            f"Profit/grid: ~{profit_per_grid:.2f}% (neto de fees). "
+            f"Centrado en ${last:,.0f}."
         )
         risk = "Moderado. Si rompe el rango, el grid pierde inventario en un lado."
-        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
 
     elif (is_bull or is_bear) and not is_strong and moderate:
         strategy = "GRID ASIMETRICO"
         strategy_color = "#FFD54F"
         strategy_icon = "📐"
+        total_levels = max(50, min(100, int(op80_amp / 0.15)))
         if is_bull:
             bias_dir = "alcista"
             more_levels_side = "arriba"
-            # Mas niveles arriba del precio actual
-            levels_up = 8
-            levels_down = 5
+            # 60/40 split: mas niveles arriba del precio actual
+            levels_up = int(total_levels * 0.6)
+            levels_down = total_levels - levels_up
         else:
             bias_dir = "bajista"
             more_levels_side = "abajo"
-            levels_up = 5
-            levels_down = 8
+            levels_down = int(total_levels * 0.6)
+            levels_up = total_levels - levels_down
 
-        total_levels = levels_up + levels_down
+        spacing_pct = op80_amp / total_levels
+        spacing_usd = (op80_upper - op80_lower) / total_levels
+        profit_per_grid = spacing_pct - 0.1
         reason = f"Tendencia {bias_dir} moderada = sesgar grid hacia {more_levels_side}"
         details = (
-            f"Grid asimetrico: {levels_up} niveles arriba + {levels_down} abajo del precio actual. "
-            f"Rango [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
-            f"Mas niveles en la direccion del sesgo para capturar el movimiento."
+            f"Grid asimetrico de {total_levels} grillas: {levels_up} arriba + {levels_down} abajo de ${last:,.0f}. "
+            f"Rango [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%."
         )
         risk = f"Moderado-Alto. Si revierte contra el sesgo, perdida de inventario."
-        grid_levels = f"{total_levels} niveles ({levels_up} up / {levels_down} down)"
+        grid_levels = f"{total_levels} grillas ({levels_up}up/{levels_down}dn) | ${spacing_usd:,.0f} | ~{profit_per_grid:.2f}%/grid"
 
     elif is_strong or wide:
         strategy = "NO OPERAR / HEDGE PURO"
@@ -1354,30 +1360,36 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         strategy_color = "#FF9800"
         strategy_icon = "⚠️"
         reason = "Sin tendencia pero vol alta = grid con spacing amplio"
-        levels = max(6, min(12, int(op80_amp / 3)))
-        spacing = op80_amp / levels
+        levels = max(30, min(60, int(op80_amp / 0.5)))
+        spacing_pct = op80_amp / levels
+        spacing_usd = (op80_upper - op80_lower) / levels
+        profit_per_grid = spacing_pct - 0.1
         details = (
-            f"Grid conservador de {levels} niveles con spacing amplio (~{spacing:.1f}%). "
-            f"Rango [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
-            f"Menos niveles para reducir exposicion ante la alta volatilidad."
+            f"Grid conservador de {levels} grillas con spacing amplio. "
+            f"Rango [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%. "
+            f"Menos grillas para reducir exposicion ante la alta volatilidad."
         )
         risk = "Moderado-Alto. Vol alta puede generar movimientos bruscos."
-        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
 
     else:
         # Default: moderado sin tendencia clara
         strategy = "GRID NEUTRAL"
         strategy_color = "#78909C"
         strategy_icon = "⚖️"
-        levels = 10
-        spacing = op80_amp / levels if op80_amp > 0 else 1
+        levels = max(50, min(80, int(op80_amp / 0.2))) if op80_amp > 0 else 50
+        spacing_pct = op80_amp / levels if op80_amp > 0 else 0.2
+        spacing_usd = (op80_upper - op80_lower) / levels if levels > 0 else 0
+        profit_per_grid = spacing_pct - 0.1
         reason = "Condiciones mixtas — grid neutral como posicion base"
         details = (
-            f"Grid de {levels} niveles en [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
+            f"Grid de {levels} grillas en [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%. "
             f"Monitorear regimen para ajustar."
         )
         risk = "Moderado."
-        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
 
     # Posicion del precio dentro del rango 80%
     if op80_upper > op80_lower:
@@ -1455,6 +1467,205 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         f'font-size:0.9rem;margin:0;">{prob_up:.0f}% UP / {prob_down:.0f}% DN</p></div>'
         f'</div></div>'
     )
+
+
+# ============================================================================
+# SECTION D.5: Kill-Switch / Risk Monitor
+# ============================================================================
+
+def compute_kill_switch_status(
+    model: GaussianHMM,
+    current_regime: int,
+    label_map: dict,
+    range_data: dict,
+    current_price: float | None = None,
+    soft_stop_threshold: float = 0.50,
+) -> dict:
+    """
+    Evalua 3 estados del monitor de riesgo:
+
+      SOFT_STOP  — P(Bear/Strong Bear en t+1 | regimen actual) > threshold
+      HARD_STOP  — precio actual perfora limite inferior o superior proyectado
+      ACTIVE     — sin alertas; rango vigente
+
+    current_price puede ser None (se omite Hard Stop).
+    """
+    transmat = model.transmat_
+    n_regimes = model.n_components
+
+    # Identificar regimenes bearish
+    bear_indices = [
+        i for i in range(n_regimes)
+        if "bear" in label_map.get(i, "").lower()
+    ]
+    prob_bear_t1 = float(sum(transmat[current_regime, i] for i in bear_indices))
+
+    # Hard Stop
+    hard_stop = False
+    breach_dir = None
+    if current_price is not None:
+        if current_price < range_data["lower"]:
+            hard_stop = True
+            breach_dir = "DOWN"
+        elif current_price > range_data["upper"]:
+            hard_stop = True
+            breach_dir = "UP"
+
+    # Buffers expresados como % desde precio actual
+    lower_buffer = (range_data["last_close"] - range_data["lower"]) / range_data["last_close"] * 100
+    upper_buffer = (range_data["upper"] - range_data["last_close"]) / range_data["last_close"] * 100
+
+    if hard_stop:
+        dir_label = "BAJISTA" if breach_dir == "DOWN" else "ALCISTA"
+        ref_price = range_data["lower"] if breach_dir == "DOWN" else range_data["upper"]
+        return {
+            "status": "HARD_STOP",
+            "message": f"KILL SWITCH — RUPTURA ESTRUCTURAL {dir_label}",
+            "detail": (
+                f"Precio ${current_price:,.2f} perforo el limite "
+                f"{'inferior' if breach_dir == 'DOWN' else 'superior'} "
+                f"${ref_price:,.2f}"
+            ),
+            "color": "#F44336",
+            "icon": "🚨",
+            "prob_bear_t1": prob_bear_t1,
+            "lower_buffer_pct": lower_buffer,
+            "upper_buffer_pct": upper_buffer,
+            "soft_stop_threshold": soft_stop_threshold,
+        }
+
+    if prob_bear_t1 > soft_stop_threshold:
+        return {
+            "status": "SOFT_STOP",
+            "message": "LIQUIDAR POSICION — CAMBIO DE REGIMEN INMINENTE",
+            "detail": (
+                f"P(Bear t+1) = {prob_bear_t1:.1%} supera umbral de "
+                f"{soft_stop_threshold:.0%}. Regimenes bear detectados: "
+                f"{[label_map[i] for i in bear_indices]}"
+            ),
+            "color": "#FF9800",
+            "icon": "⚠️",
+            "prob_bear_t1": prob_bear_t1,
+            "lower_buffer_pct": lower_buffer,
+            "upper_buffer_pct": upper_buffer,
+            "soft_stop_threshold": soft_stop_threshold,
+        }
+
+    return {
+        "status": "ACTIVE",
+        "message": "RANGO ACTIVO — ROLL-OVER AL VENCER HORIZONTE",
+        "detail": (
+            f"P(Bear t+1) = {prob_bear_t1:.1%}. "
+            f"Buffer inferior: {lower_buffer:.1f}% | Buffer superior: {upper_buffer:.1f}%"
+        ),
+        "color": "#4CAF50",
+        "icon": "✅",
+        "prob_bear_t1": prob_bear_t1,
+        "lower_buffer_pct": lower_buffer,
+        "upper_buffer_pct": upper_buffer,
+        "soft_stop_threshold": soft_stop_threshold,
+    }
+
+
+def render_kill_switch_panel(
+    ks: dict,
+    range_data: dict,
+    ticker: str,
+    timeframe: str,
+    model: GaussianHMM,
+    current_regime: int,
+    label_map: dict,
+):
+    """
+    Renderiza el panel de monitor de riesgo.
+    Incluye boton de verificacion de precio en vivo para Hard Stop.
+    """
+    color = ks["color"]
+    glow = color + "33"
+
+    st.html(
+        f'<div style="background:linear-gradient(135deg,#1E222D 0%,#131722 100%);'
+        f'border-radius:12px;padding:20px 24px;border:2px solid {color};'
+        f'box-shadow:0 0 20px {glow};margin-bottom:16px;">'
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">'
+        f'<span style="font-size:1.8rem;">{ks["icon"]}</span>'
+        f'<div>'
+        f'<p style="color:{color};font-size:0.72rem;text-transform:uppercase;'
+        f'letter-spacing:1.5px;margin:0 0 2px 0;font-weight:600;">Monitor de Riesgo</p>'
+        f'<p style="color:{color};font-size:1.15rem;font-weight:700;margin:0;'
+        f'font-family:Consolas,Monaco,monospace;">{ks["message"]}</p>'
+        f'</div></div>'
+        f'<p style="color:#787B86;font-size:0.88rem;margin:0 0 16px 0;">{ks["detail"]}</p>'
+        f'<div style="display:flex;gap:28px;flex-wrap:wrap;">'
+        f'<div>'
+        f'<p style="color:#787B86;font-size:0.68rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 2px 0;">P(Bear t+1)</p>'
+        f'<p style="color:{color};font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">{ks["prob_bear_t1"]:.1%}</p>'
+        f'</div>'
+        f'<div>'
+        f'<p style="color:#787B86;font-size:0.68rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 2px 0;">Buffer Inferior</p>'
+        f'<p style="color:#F44336;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">'
+        f'${range_data["lower"]:,.2f} ({ks["lower_buffer_pct"]:.1f}%)</p>'
+        f'</div>'
+        f'<div>'
+        f'<p style="color:#787B86;font-size:0.68rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 2px 0;">Buffer Superior</p>'
+        f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">'
+        f'${range_data["upper"]:,.2f} (+{ks["upper_buffer_pct"]:.1f}%)</p>'
+        f'</div>'
+        f'<div>'
+        f'<p style="color:#787B86;font-size:0.68rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 2px 0;">Umbral Soft Stop</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.1rem;font-weight:700;margin:0;">{ks["soft_stop_threshold"]:.0%}</p>'
+        f'</div>'
+        f'</div>'
+        f'</div>'
+    )
+
+    # Boton para verificar precio en vivo (Hard Stop check)
+    if st.button("Verificar precio en vivo", key="btn_live_price"):
+        try:
+            df_live = fetch_data(ticker, timeframe)
+            live_price = float(df_live["Close"].squeeze().iloc[-1])
+            ks_live = compute_kill_switch_status(
+                model, current_regime, label_map, range_data,
+                current_price=live_price,
+                soft_stop_threshold=ks["soft_stop_threshold"],
+            )
+            new_color = ks_live["color"]
+            new_glow = new_color + "33"
+            breach_msg = ""
+            if ks_live["status"] == "HARD_STOP":
+                breach_msg = (
+                    f'<p style="color:#F44336;font-size:1rem;font-weight:700;margin:8px 0 0 0;">'
+                    f'🚨 {ks_live["message"]}</p>'
+                    f'<p style="color:#787B86;font-size:0.85rem;margin:4px 0 0 0;">'
+                    f'{ks_live["detail"]}</p>'
+                )
+            else:
+                breach_msg = (
+                    f'<p style="color:{new_color};font-size:1rem;font-weight:700;margin:8px 0 0 0;">'
+                    f'{ks_live["icon"]} {ks_live["message"]}</p>'
+                    f'<p style="color:#787B86;font-size:0.85rem;margin:4px 0 0 0;">'
+                    f'{ks_live["detail"]}</p>'
+                )
+            st.html(
+                f'<div style="background:#1E222D;border-radius:8px;padding:14px 18px;'
+                f'border:1px solid {new_color};box-shadow:0 0 12px {new_glow};margin-top:8px;">'
+                f'<p style="color:#787B86;font-size:0.72rem;text-transform:uppercase;'
+                f'letter-spacing:0.8px;margin:0;">Precio live: '
+                f'<span style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+                f'font-weight:700;">${live_price:,.4f}</span></p>'
+                f'{breach_msg}'
+                f'</div>'
+            )
+        except Exception as e:
+            st.error(f"Error al obtener precio en vivo: {e}")
 
 
 # ============================================================================
@@ -2049,6 +2260,19 @@ def _display_results():
 
     # ── 1.6 Recomendacion de estrategia LP/Grid/Hedge ────────────────
     render_strategy_recommendation(range_data, current_label, current_color, timeframe)
+
+    # ── 1.7 Monitor de riesgo / Kill-Switches ────────────────────────
+    st.html("<br>")
+    st.html('<div class="section-title">🛡️ Monitor de Riesgo</div>')
+    ks_status = compute_kill_switch_status(
+        model, current_regime, label_map, range_data,
+        current_price=None,   # evaluacion estatica; hard stop via boton live
+        soft_stop_threshold=0.50,
+    )
+    render_kill_switch_panel(
+        ks_status, range_data, ticker, timeframe,
+        model, current_regime, label_map,
+    )
 
     # ── 2. Grafico de velas + tunel de rango (full width, grande) ────
     fig_candle = plot_candlestick_with_regimes(
