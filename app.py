@@ -1487,80 +1487,136 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
 
 
 # ============================================================================
-# SECTION D.4b: Geometric Grid with Gaussian Sizing
+# SECTION D.4b: Quant Grid Engine (Hurst + Realized Vol + Gaussian Sizing)
 # ============================================================================
 
-def compute_atr(df, period: int = 14) -> float:
-    """Calcula ATR (Average True Range) sobre las ultimas `period` velas."""
-    high = df["High"].squeeze()
-    low = df["Low"].squeeze()
-    close = df["Close"].squeeze()
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return float(atr.iloc[-1])
-
-
-def _compute_density_factor(regime_label: str, op80_amp: float) -> tuple:
+def compute_hurst(close_series, max_lag: int = 40) -> float:
     """
-    Determina el divisor de ATR segun regimen y amplitud.
-    Retorna (divisor, descripcion).
-    Mayor divisor = mas grillas = spacing mas chico.
+    Calcula el Exponente de Hurst via Rescaled Range (R/S).
+    H < 0.5 = mean reverting, H = 0.5 = random walk, H > 0.5 = trending.
     """
-    label = regime_label.lower()
-    is_strong = "strong" in label
-    is_sideways = "sideways" in label
-    is_bull = "bull" in label
-    is_bear = "bear" in label
+    prices = close_series.dropna().values
+    if len(prices) < max_lag + 10:
+        return 0.5  # default si no hay datos suficientes
 
-    # Volatilidad relativa del rango
-    low_vol = op80_amp < 12
-    high_vol = op80_amp > 25
+    lags = range(10, min(max_lag + 1, len(prices) // 2))
+    rs_values = []
+    lag_values = []
 
-    if is_sideways and low_vol:
-        return 4, "Sideways + vol baja → ATR/4 (micro-rebotes)"
-    elif is_sideways and high_vol:
-        return 2, "Sideways + vol alta → ATR/2 (rebotes amplios)"
-    elif is_sideways:
-        return 3, "Sideways moderado → ATR/3"
-    elif (is_bull or is_bear) and not is_strong:
-        return 3, f"Tendencia moderada → ATR/3"
-    elif is_strong:
-        return 2, "Tendencia fuerte → ATR/2 (poco rebote)"
+    for lag in lags:
+        rs_list = []
+        for start in range(0, len(prices) - lag, lag):
+            chunk = prices[start:start + lag]
+            if len(chunk) < lag:
+                continue
+            returns = np.diff(np.log(chunk))
+            if len(returns) == 0:
+                continue
+            mean_ret = np.mean(returns)
+            deviations = np.cumsum(returns - mean_ret)
+            R = np.max(deviations) - np.min(deviations)
+            S = np.std(returns, ddof=1)
+            if S > 0:
+                rs_list.append(R / S)
+        if rs_list:
+            rs_values.append(np.mean(rs_list))
+            lag_values.append(lag)
+
+    if len(rs_values) < 3:
+        return 0.5
+
+    # Regresion log-log: log(R/S) = H * log(n) + c
+    log_lags = np.log(lag_values)
+    log_rs = np.log(rs_values)
+    H = np.polyfit(log_lags, log_rs, 1)[0]
+
+    # Clamp a [0.01, 0.99] para evitar extremos
+    return float(np.clip(H, 0.01, 0.99))
+
+
+def compute_realized_vol(close_series, window: int = 14) -> float:
+    """
+    Volatilidad realizada como std de log-returns sobre las ultimas `window` velas.
+    Retorna en porcentaje.
+    """
+    log_ret = np.log(close_series / close_series.shift(1)).dropna()
+    if len(log_ret) < window:
+        return float(log_ret.std() * 100) if len(log_ret) > 1 else 1.0
+    return float(log_ret.iloc[-window:].std() * 100)
+
+
+def compute_expected_crossings(sigma_pct: float, spacing_pct: float) -> float:
+    """
+    Frecuencia esperada de cruces por nivel por periodo.
+    Para random walk: crossings ~ sigma / (sqrt(2*pi) * spacing)
+    """
+    if spacing_pct <= 0:
+        return 0
+    return sigma_pct / (np.sqrt(2 * np.pi) * spacing_pct)
+
+
+def compute_optimal_spacing(hurst: float, sigma_pct: float,
+                            fee_rt_pct: float) -> tuple:
+    """
+    Calcula spacing optimo basado en Hurst exponent.
+
+    H <= 0.5 (mean reverting): spacing = 2 * fee (maximo de grillas rentables)
+    H > 0.5 (trending): spacing escala con H para compensar menor rebote
+
+    Returns: (spacing_pct, regime_type, description)
+    """
+    min_spacing = 2 * fee_rt_pct  # floor matematico
+
+    if hurst <= 0.45:
+        # Fuertemente mean reverting - maximo de grillas
+        spacing = min_spacing
+        regime_type = "MEAN REVERTING"
+        desc = f"H={hurst:.2f} < 0.45 — Precio rebota, max grillas (spacing = 2*fee = {min_spacing:.2f}%)"
+    elif hurst <= 0.55:
+        # Random walk - spacing = 2*fee (optimo analitico)
+        spacing = min_spacing
+        regime_type = "RANDOM WALK"
+        desc = f"H={hurst:.2f} ~ 0.50 — Caminata aleatoria, spacing optimo = 2*fee = {min_spacing:.2f}%"
+    elif hurst <= 0.65:
+        # Leve tendencia - incrementar spacing
+        # Interpolar entre 2*fee y sigma-based
+        trend_factor = (hurst - 0.55) / 0.10  # 0 a 1
+        sigma_spacing = sigma_pct * 0.5  # medio sigma como techo
+        spacing = min_spacing + trend_factor * (sigma_spacing - min_spacing)
+        spacing = max(spacing, min_spacing)
+        regime_type = "LEVE TENDENCIA"
+        desc = f"H={hurst:.2f} — Leve tendencia, spacing ajustado a {spacing:.2f}%"
     else:
-        return 3, "Default → ATR/3"
+        # Fuerte tendencia - spacing basado en sigma
+        sigma_spacing = sigma_pct * 0.7  # 70% de sigma
+        spacing = max(sigma_spacing, min_spacing)
+        regime_type = "TENDENCIA FUERTE"
+        desc = f"H={hurst:.2f} > 0.65 — Tendencia fuerte, spacing = 0.7*sigma = {spacing:.2f}%"
+
+    return spacing, regime_type, desc
 
 
-def generate_geometric_grid(lower: float, upper: float, atr: float,
+def generate_geometric_grid(lower: float, upper: float,
+                            hurst: float, sigma_pct: float,
                             fee_rt_pct: float, leverage: int,
-                            last_close: float, regime_label: str = "",
-                            op80_amp: float = 0,
+                            last_close: float,
                             total_investment: float = 10000):
     """
-    Genera grillas con progresion geometrica basada en ATR/densidad,
-    con floor en 2*fee_RT, y sizing gaussiano.
-    La densidad se adapta al regimen actual.
+    Genera grillas con progresion geometrica optimizada por Hurst + sigma.
+    Sizing gaussiano centrado en last_close.
 
-    Returns: (grid_data, spacing_pct, atr_pct, density, density_desc)
+    Returns: (grid_data, spacing_pct, hurst, sigma_pct, regime_type, regime_desc,
+              expected_crossings, expected_daily_profit)
     """
-    # Factor de densidad adaptativo al regimen
-    density, density_desc = _compute_density_factor(regime_label, op80_amp)
-
-    # Spacing base = ATR/densidad en porcentaje del precio medio
-    mid = (upper + lower) / 2
-    atr_pct = (atr / mid) * 100  # ATR como % del precio medio
-    spacing_pct = atr_pct / density
-
-    # Floor: minimo rentable = 2 * fee_RT
-    min_spacing = 2 * fee_rt_pct
-    spacing_pct = max(spacing_pct, min_spacing)
+    # Spacing optimo derivado de Hurst
+    spacing_pct, regime_type, regime_desc = compute_optimal_spacing(
+        hurst, sigma_pct, fee_rt_pct
+    )
 
     # Factor multiplicativo para progresion geometrica
     ratio = 1 + (spacing_pct / 100)
 
-    # Generar niveles desde lower hasta upper con progresion geometrica
+    # Generar niveles desde lower hasta upper
     levels = []
     price = lower
     while price <= upper:
@@ -1573,36 +1629,45 @@ def generate_geometric_grid(lower: float, upper: float, atr: float,
 
     n_levels = len(levels)
     if n_levels < 2:
-        return [], spacing_pct, atr_pct, density, density_desc
+        return [], spacing_pct, hurst, sigma_pct, regime_type, regime_desc, 0, 0
 
-    # Gaussian weighting: centro en last_close, sigma = rango/4
-    sigma = (upper - lower) / 4  # 95% del peso dentro del rango
-    if sigma == 0:
-        sigma = 1
+    # Gaussian weighting: centro en last_close, sigma_gauss = rango/4
+    sigma_gauss = (upper - lower) / 4
+    if sigma_gauss == 0:
+        sigma_gauss = 1
 
     weights = []
     for p in levels:
-        w = np.exp(-((p - last_close) ** 2) / (2 * sigma ** 2))
+        w = np.exp(-((p - last_close) ** 2) / (2 * sigma_gauss ** 2))
         weights.append(w)
 
-    # Normalizar pesos para que sumen 1
     total_w = sum(weights)
     if total_w > 0:
         weights = [w / total_w for w in weights]
 
-    # Calcular size en USD por nivel
+    # Frecuencia esperada de cruces por nivel por periodo
+    crossings_per_period = compute_expected_crossings(sigma_pct, spacing_pct)
+
+    # Calcular grid data con expected profit por nivel
     grid_data = []
     cumulative = 0
+    total_daily_profit = 0
+
     for i, (price, weight) in enumerate(zip(levels, weights)):
         size_usd = total_investment * weight
         cumulative += size_usd
-        # Spacing local (distancia al siguiente nivel)
+
         if i < len(levels) - 1:
             local_spacing_pct = (levels[i + 1] - price) / price * 100
-            local_profit = (local_spacing_pct - fee_rt_pct) * leverage
+            local_profit_pct = (local_spacing_pct - fee_rt_pct) * leverage
+            # Expected daily profit para este nivel
+            level_daily_profit = crossings_per_period * local_profit_pct / 100 * size_usd
         else:
             local_spacing_pct = 0
-            local_profit = 0
+            local_profit_pct = 0
+            level_daily_profit = 0
+
+        total_daily_profit += level_daily_profit
 
         grid_data.append({
             "level": i + 1,
@@ -1611,30 +1676,35 @@ def generate_geometric_grid(lower: float, upper: float, atr: float,
             "weight_pct": weight * 100,
             "cumulative_usd": cumulative,
             "spacing_pct": local_spacing_pct,
-            "profit_pct": local_profit,
+            "profit_pct": local_profit_pct,
+            "daily_profit": level_daily_profit,
         })
 
-    return grid_data, spacing_pct, atr_pct, density, density_desc
+    return (grid_data, spacing_pct, hurst, sigma_pct, regime_type, regime_desc,
+            crossings_per_period, total_daily_profit)
 
 
 def render_grid_table(df, range_data: dict, current_label: str,
                       leverage: int = 1, total_investment: float = 10000):
     """
-    Renderiza la tabla de grillas geometricas con sizing gaussiano.
+    Renderiza la tabla de grillas optimizadas por Hurst + sigma + Gauss sizing.
     """
-    # Calcular ATR
-    atr = compute_atr(df)
+    close = df["Close"].squeeze()
     last_close = range_data["last_close"]
     op80_upper = range_data["op80_upper"]
     op80_lower = range_data["op80_lower"]
 
+    # Calcular Hurst y sigma realizada
+    hurst = compute_hurst(close)
+    sigma_pct = compute_realized_vol(close)
+
     # Fee segun mercado
     fee_rt = 0.10 if leverage == 1 else 0.07
-    op80_amp = range_data.get("op80_amplitude", 0)
 
-    grid_data, spacing_pct, atr_pct, density, density_desc = generate_geometric_grid(
-        op80_lower, op80_upper, atr, fee_rt, leverage, last_close,
-        current_label, op80_amp, total_investment
+    (grid_data, spacing_pct, hurst_val, sigma_val, regime_type, regime_desc,
+     crossings, daily_profit) = generate_geometric_grid(
+        op80_lower, op80_upper, hurst, sigma_pct,
+        fee_rt, leverage, last_close, total_investment
     )
 
     if not grid_data:
@@ -1644,8 +1714,19 @@ def render_grid_table(df, range_data: dict, current_label: str,
     n_grids = len(grid_data)
     market_label = "Spot" if leverage == 1 else f"Futuros {leverage}x"
 
-    # Profit total estimado (si todas las grillas ejecutan 1 round-trip)
-    total_profit_one_cycle = sum(g["profit_pct"] * g["size_usd"] / 100 for g in grid_data if g["profit_pct"] > 0)
+    # Profit total 1 ciclo completo
+    total_profit_one_cycle = sum(
+        g["profit_pct"] * g["size_usd"] / 100
+        for g in grid_data if g["profit_pct"] > 0
+    )
+
+    # Hurst color coding
+    if hurst < 0.45:
+        h_color = "#4CAF50"  # verde - mean reverting (bueno para grid)
+    elif hurst < 0.55:
+        h_color = "#FFD54F"  # amarillo - neutral
+    else:
+        h_color = "#EF5350"  # rojo - trending (malo para grid)
 
     # Header card
     st.html(
@@ -1658,54 +1739,68 @@ def render_grid_table(df, range_data: dict, current_label: str,
         f'margin-bottom:16px;flex-wrap:wrap;gap:12px;">'
         f'<div>'
         f'<p style="color:#AB47BC;font-size:0.75rem;text-transform:uppercase;'
-        f'letter-spacing:1px;margin:0 0 4px 0;">GRILLA GEOMETRICA + GAUSS SIZING</p>'
+        f'letter-spacing:1px;margin:0 0 4px 0;">QUANT GRID ENGINE</p>'
         f'<p style="color:#D1D4DC;font-size:1.4rem;font-weight:700;'
         f'font-family:Consolas,Monaco,monospace;margin:0;">'
         f'{n_grids} niveles | {market_label}</p>'
         f'</div>'
         f'<div style="text-align:right;">'
+        f'<p style="color:{h_color};font-size:0.8rem;font-weight:700;margin:0 0 2px 0;">'
+        f'Hurst: {hurst:.2f} — {regime_type}</p>'
         f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
-        f'ATR(14): ${atr:,.0f} ({atr_pct:.2f}%)</p>'
+        f'Sigma realizada: {sigma_val:.2f}%/periodo</p>'
         f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
-        f'Spacing: {spacing_pct:.2f}% (ATR/{density})</p>'
-        f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
-        f'Densidad: {density}x — {density_desc}</p>'
+        f'Spacing optimo: {spacing_pct:.3f}%</p>'
         f'<p style="color:#787B86;font-size:0.7rem;margin:0;">'
-        f'Floor fee: {2*fee_rt:.2f}%</p>'
+        f'Cruces esperados: {crossings:.2f}/nivel/periodo</p>'
         f'</div></div>'
+        # Hurst explanation
+        f'<div style="background:#131722;border-radius:8px;padding:10px 14px;'
+        f'margin-bottom:12px;border-left:3px solid {h_color};">'
+        f'<p style="color:#D1D4DC;font-size:0.8rem;margin:0;line-height:1.5;">'
+        f'{regime_desc}</p></div>'
         # Metricas resumen
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">'
         # Inversion
-        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
         f'padding:10px 14px;border:1px solid #2A2E39;">'
         f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 3px 0;">Inversion Total</p>'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Inversion</p>'
         f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
         f'font-size:1rem;font-weight:700;margin:0;">${total_investment:,.0f}</p></div>'
         # Profit 1 ciclo
-        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
         f'padding:10px 14px;border:1px solid #2A2E39;">'
         f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 3px 0;">Profit 1 Ciclo Completo</p>'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Profit 1 Ciclo</p>'
         f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
         f'font-size:1rem;font-weight:700;margin:0;">${total_profit_one_cycle:,.2f} '
         f'({total_profit_one_cycle/total_investment*100:.2f}%)</p></div>'
-        # Rango
-        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        # Daily expected
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
         f'padding:10px 14px;border:1px solid #2A2E39;">'
         f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 3px 0;">Rango Operativo</p>'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Profit Diario Esperado</p>'
+        f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1rem;font-weight:700;margin:0;">${daily_profit:,.2f}/dia '
+        f'({daily_profit/total_investment*100:.3f}%)</p></div>'
+        # Rango
+        f'<div style="flex:1;min-width:120px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Rango 80%</p>'
         f'<p style="color:#AB47BC;font-family:Consolas,Monaco,monospace;'
         f'font-size:1rem;font-weight:700;margin:0;">${op80_lower:,.0f} — ${op80_upper:,.0f}</p></div>'
         f'</div>'
-        # Explicacion formula
+        # Formula
         f'<div style="background:#131722;border-radius:8px;padding:10px 14px;'
         f'margin-bottom:16px;border-left:3px solid #AB47BC;">'
-        f'<p style="color:#787B86;font-size:0.75rem;margin:0;line-height:1.5;">'
-        f'<b style="color:#D1D4DC;">Formula:</b> '
-        f'spacing = max(ATR/{density}, 2*fee) | '
-        f'price[i+1] = price[i] * (1 + {spacing_pct:.2f}%) | '
-        f'size[i] = inv * gauss(price[i], center=${last_close:,.0f}, '
+        f'<p style="color:#787B86;font-size:0.72rem;margin:0;line-height:1.6;">'
+        f'<b style="color:#D1D4DC;">Derivacion:</b> '
+        f'E[profit] = N * (s-fee) * sigma/(sqrt(2pi)*s) | '
+        f'dE/ds = 0 ==> s_opt = 2*fee = {2*fee_rt:.2f}% (H&lt;=0.5) | '
+        f'N = ln(P90/P10) / ln(1+s) = {n_grids} | '
+        f'size[i] = gauss(price, mu=${last_close:,.0f}, '
         f'sigma=${(op80_upper-op80_lower)/4:,.0f})</p>'
         f'</div>'
         f'</div>'
@@ -1726,6 +1821,8 @@ def render_grid_table(df, range_data: dict, current_label: str,
         # Barra visual del weight
         bar_width = min(g["weight_pct"] * n_grids, 100)  # escalar para visualizacion
 
+        daily_color = "#4CAF50" if g["daily_profit"] > 0 else "#787B86"
+
         rows_html += (
             f'<tr style="background:{row_bg};{row_border}">'
             f'<td style="padding:4px 8px;color:#787B86;font-size:0.75rem;text-align:center;">{g["level"]}</td>'
@@ -1740,10 +1837,12 @@ def render_grid_table(df, range_data: dict, current_label: str,
             f'</div>'
             f' <span style="color:#787B86;font-size:0.7rem;">{g["weight_pct"]:.1f}%</span></td>'
             f'<td style="padding:4px 8px;color:#787B86;font-family:Consolas,Monaco,monospace;'
-            f'font-size:0.75rem;text-align:right;">{g["spacing_pct"]:.2f}%</td>'
+            f'font-size:0.75rem;text-align:right;">{g["spacing_pct"]:.3f}%</td>'
             f'<td style="padding:4px 8px;color:{"#4CAF50" if g["profit_pct"] > 0 else "#787B86"};'
             f'font-family:Consolas,Monaco,monospace;font-size:0.75rem;text-align:right;">'
-            f'{"+" if g["profit_pct"] > 0 else ""}{g["profit_pct"]:.2f}%</td>'
+            f'{"+" if g["profit_pct"] > 0 else ""}{g["profit_pct"]:.3f}%</td>'
+            f'<td style="padding:4px 8px;color:{daily_color};font-family:Consolas,Monaco,monospace;'
+            f'font-size:0.75rem;text-align:right;">${g["daily_profit"]:.2f}</td>'
             f'</tr>'
         )
 
@@ -1764,6 +1863,8 @@ def render_grid_table(df, range_data: dict, current_label: str,
         f'letter-spacing:0.8px;text-align:right;">Spacing</th>'
         f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
         f'letter-spacing:0.8px;text-align:right;">Profit/Grid</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:right;">E[$/dia]</th>'
         f'</tr></thead>'
         f'<tbody>{rows_html}</tbody>'
         f'</table></div>'
