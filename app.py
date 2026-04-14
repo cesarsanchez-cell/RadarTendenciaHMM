@@ -1487,6 +1487,250 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
 
 
 # ============================================================================
+# SECTION D.4b: Geometric Grid with Gaussian Sizing
+# ============================================================================
+
+def compute_atr(df, period: int = 14) -> float:
+    """Calcula ATR (Average True Range) sobre las ultimas `period` velas."""
+    high = df["High"].squeeze()
+    low = df["Low"].squeeze()
+    close = df["Close"].squeeze()
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return float(atr.iloc[-1])
+
+
+def generate_geometric_grid(lower: float, upper: float, atr: float,
+                            fee_rt_pct: float, leverage: int,
+                            last_close: float, total_investment: float = 10000):
+    """
+    Genera grillas con progresion geometrica basada en ATR/2,
+    con floor en 2*fee_RT, y sizing gaussiano.
+
+    Returns: list of dicts con price, size, weight, cumulative
+    """
+    # Spacing base = ATR/2 en porcentaje del precio medio
+    mid = (upper + lower) / 2
+    atr_pct = (atr / mid) * 100  # ATR como % del precio medio
+    spacing_pct = atr_pct / 2    # ATR/2
+
+    # Floor: minimo rentable = 2 * fee_RT
+    min_spacing = 2 * fee_rt_pct
+    spacing_pct = max(spacing_pct, min_spacing)
+
+    # Factor multiplicativo para progresion geometrica
+    ratio = 1 + (spacing_pct / 100)
+
+    # Generar niveles desde lower hasta upper con progresion geometrica
+    levels = []
+    price = lower
+    while price <= upper:
+        levels.append(price)
+        price = price * ratio
+
+    # Asegurar que el upper bound este incluido
+    if len(levels) == 0 or levels[-1] < upper * 0.999:
+        levels.append(upper)
+
+    n_levels = len(levels)
+    if n_levels < 2:
+        return [], spacing_pct, atr_pct
+
+    # Gaussian weighting: centro en last_close, sigma = rango/4
+    sigma = (upper - lower) / 4  # 95% del peso dentro del rango
+    if sigma == 0:
+        sigma = 1
+
+    weights = []
+    for p in levels:
+        w = np.exp(-((p - last_close) ** 2) / (2 * sigma ** 2))
+        weights.append(w)
+
+    # Normalizar pesos para que sumen 1
+    total_w = sum(weights)
+    if total_w > 0:
+        weights = [w / total_w for w in weights]
+
+    # Calcular size en USD por nivel
+    grid_data = []
+    cumulative = 0
+    for i, (price, weight) in enumerate(zip(levels, weights)):
+        size_usd = total_investment * weight
+        cumulative += size_usd
+        # Spacing local (distancia al siguiente nivel)
+        if i < len(levels) - 1:
+            local_spacing_pct = (levels[i + 1] - price) / price * 100
+            local_profit = (local_spacing_pct - fee_rt_pct) * leverage
+        else:
+            local_spacing_pct = 0
+            local_profit = 0
+
+        grid_data.append({
+            "level": i + 1,
+            "price": price,
+            "size_usd": size_usd,
+            "weight_pct": weight * 100,
+            "cumulative_usd": cumulative,
+            "spacing_pct": local_spacing_pct,
+            "profit_pct": local_profit,
+        })
+
+    return grid_data, spacing_pct, atr_pct
+
+
+def render_grid_table(df, range_data: dict, leverage: int = 1,
+                      total_investment: float = 10000):
+    """
+    Renderiza la tabla de grillas geometricas con sizing gaussiano.
+    """
+    # Calcular ATR
+    atr = compute_atr(df)
+    last_close = range_data["last_close"]
+    op80_upper = range_data["op80_upper"]
+    op80_lower = range_data["op80_lower"]
+
+    # Fee segun mercado
+    fee_rt = 0.10 if leverage == 1 else 0.07
+
+    grid_data, spacing_pct, atr_pct = generate_geometric_grid(
+        op80_lower, op80_upper, atr, fee_rt, leverage, last_close, total_investment
+    )
+
+    if not grid_data:
+        st.warning("No se pudieron generar grillas con los parametros actuales.")
+        return
+
+    n_grids = len(grid_data)
+    market_label = "Spot" if leverage == 1 else f"Futuros {leverage}x"
+
+    # Profit total estimado (si todas las grillas ejecutan 1 round-trip)
+    total_profit_one_cycle = sum(g["profit_pct"] * g["size_usd"] / 100 for g in grid_data if g["profit_pct"] > 0)
+
+    # Header card
+    st.html(
+        f'<div style="background:linear-gradient(135deg,#1E222D 0%,#131722 100%);'
+        f'border-radius:12px;padding:24px 28px;margin-bottom:4px;'
+        f'border:1px solid #2A2E39;border-top:3px solid #AB47BC;'
+        f'box-shadow:0 4px 24px rgba(0,0,0,0.3);">'
+        # Title
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'margin-bottom:16px;flex-wrap:wrap;gap:12px;">'
+        f'<div>'
+        f'<p style="color:#AB47BC;font-size:0.75rem;text-transform:uppercase;'
+        f'letter-spacing:1px;margin:0 0 4px 0;">GRILLA GEOMETRICA + GAUSS SIZING</p>'
+        f'<p style="color:#D1D4DC;font-size:1.4rem;font-weight:700;'
+        f'font-family:Consolas,Monaco,monospace;margin:0;">'
+        f'{n_grids} niveles | {market_label}</p>'
+        f'</div>'
+        f'<div style="text-align:right;">'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
+        f'ATR(14): ${atr:,.0f} ({atr_pct:.2f}%)</p>'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
+        f'Spacing base: {spacing_pct:.2f}% (ATR/2)</p>'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0;">'
+        f'Floor fee: {2*fee_rt:.2f}%</p>'
+        f'</div></div>'
+        # Metricas resumen
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">'
+        # Inversion
+        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Inversion Total</p>'
+        f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1rem;font-weight:700;margin:0;">${total_investment:,.0f}</p></div>'
+        # Profit 1 ciclo
+        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Profit 1 Ciclo Completo</p>'
+        f'<p style="color:#4CAF50;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1rem;font-weight:700;margin:0;">${total_profit_one_cycle:,.2f} '
+        f'({total_profit_one_cycle/total_investment*100:.2f}%)</p></div>'
+        # Rango
+        f'<div style="flex:1;min-width:130px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Rango Operativo</p>'
+        f'<p style="color:#AB47BC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1rem;font-weight:700;margin:0;">${op80_lower:,.0f} — ${op80_upper:,.0f}</p></div>'
+        f'</div>'
+        # Explicacion formula
+        f'<div style="background:#131722;border-radius:8px;padding:10px 14px;'
+        f'margin-bottom:16px;border-left:3px solid #AB47BC;">'
+        f'<p style="color:#787B86;font-size:0.75rem;margin:0;line-height:1.5;">'
+        f'<b style="color:#D1D4DC;">Formula:</b> '
+        f'spacing = max(ATR/2, 2*fee) | '
+        f'price[i+1] = price[i] * (1 + spacing%) | '
+        f'size[i] = inv * gauss(price[i], center=${last_close:,.0f}, '
+        f'sigma=${(op80_upper-op80_lower)/4:,.0f})</p>'
+        f'</div>'
+        f'</div>'
+    )
+
+    # Tabla de niveles
+    # Encontrar el nivel mas cercano al precio actual para destacarlo
+    closest_idx = min(range(len(grid_data)), key=lambda i: abs(grid_data[i]["price"] - last_close))
+
+    rows_html = ""
+    for g in grid_data:
+        is_current = (g["level"] == grid_data[closest_idx]["level"])
+        row_bg = "#1a2332" if is_current else "#131722"
+        row_border = "border-left:3px solid #AB47BC;" if is_current else "border-left:3px solid transparent;"
+        price_color = "#AB47BC" if is_current else "#D1D4DC"
+        current_marker = " ◀" if is_current else ""
+
+        # Barra visual del weight
+        bar_width = min(g["weight_pct"] * n_grids, 100)  # escalar para visualizacion
+
+        rows_html += (
+            f'<tr style="background:{row_bg};{row_border}">'
+            f'<td style="padding:4px 8px;color:#787B86;font-size:0.75rem;text-align:center;">{g["level"]}</td>'
+            f'<td style="padding:4px 8px;color:{price_color};font-family:Consolas,Monaco,monospace;'
+            f'font-size:0.85rem;font-weight:{"700" if is_current else "400"};">'
+            f'${g["price"]:,.0f}{current_marker}</td>'
+            f'<td style="padding:4px 8px;color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+            f'font-size:0.8rem;text-align:right;">${g["size_usd"]:,.1f}</td>'
+            f'<td style="padding:4px 8px;text-align:left;">'
+            f'<div style="background:#2A2E39;border-radius:3px;height:12px;width:80px;display:inline-block;">'
+            f'<div style="background:#AB47BC;border-radius:3px;height:12px;width:{bar_width:.0f}%;"></div>'
+            f'</div>'
+            f' <span style="color:#787B86;font-size:0.7rem;">{g["weight_pct"]:.1f}%</span></td>'
+            f'<td style="padding:4px 8px;color:#787B86;font-family:Consolas,Monaco,monospace;'
+            f'font-size:0.75rem;text-align:right;">{g["spacing_pct"]:.2f}%</td>'
+            f'<td style="padding:4px 8px;color:{"#4CAF50" if g["profit_pct"] > 0 else "#787B86"};'
+            f'font-family:Consolas,Monaco,monospace;font-size:0.75rem;text-align:right;">'
+            f'{"+" if g["profit_pct"] > 0 else ""}{g["profit_pct"]:.2f}%</td>'
+            f'</tr>'
+        )
+
+    st.html(
+        f'<div style="background:#131722;border-radius:12px;padding:16px;'
+        f'border:1px solid #2A2E39;overflow-x:auto;">'
+        f'<table style="width:100%;border-collapse:collapse;font-size:0.8rem;">'
+        f'<thead><tr style="border-bottom:1px solid #2A2E39;">'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:center;">Nivel</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:left;">Precio</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:right;">Size (USD)</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:left;">Peso Gauss</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:right;">Spacing</th>'
+        f'<th style="padding:6px 8px;color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;text-align:right;">Profit/Grid</th>'
+        f'</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table></div>'
+    )
+
+
+# ============================================================================
 # SECTION D.5: Kill-Switch / Risk Monitor
 # ============================================================================
 
@@ -2169,6 +2413,15 @@ def main():
             help="1x = Spot. 2x+ = Futuros. Afecta fees y profit/grid",
         )
 
+        grid_investment = st.number_input(
+            "Inversion Grid (USD)",
+            min_value=100,
+            max_value=1000000,
+            value=10000,
+            step=1000,
+            help="Capital total a distribuir en la grilla",
+        )
+
         st.html("<br>")
         train_button = st.button("🚀 Entrenar Modelo", use_container_width=True)
 
@@ -2182,7 +2435,7 @@ def main():
         st.session_state.trained = False
 
     if train_button:
-        _run_pipeline(ticker, timeframe, n_regimes, n_projection, leverage)
+        _run_pipeline(ticker, timeframe, n_regimes, n_projection, leverage, grid_investment)
 
     if st.session_state.trained:
         _display_results()
@@ -2200,7 +2453,8 @@ def main():
 
 
 def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
-                  n_projection: int = 10, leverage: int = 1):
+                  n_projection: int = 10, leverage: int = 1,
+                  grid_investment: float = 10000):
     """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project -> range."""
     config = TIMEFRAME_CONFIG[timeframe]
 
@@ -2254,6 +2508,7 @@ def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
     st.session_state.n_regimes = n_regimes
     st.session_state.n_projection = n_projection
     st.session_state.leverage = leverage
+    st.session_state.grid_investment = grid_investment
     st.session_state.scaler = scaler
     st.session_state.converged = converged
     st.session_state.trained = True
@@ -2292,6 +2547,10 @@ def _display_results():
     # ── 1.6 Recomendacion de estrategia LP/Grid/Hedge ────────────────
     leverage = st.session_state.get("leverage", 1)
     render_strategy_recommendation(range_data, current_label, current_color, timeframe, leverage)
+
+    # ── 1.65 Tabla de grillas geometricas + Gauss sizing ─────────────
+    grid_investment = st.session_state.get("grid_investment", 10000)
+    render_grid_table(df, range_data, leverage, grid_investment)
 
     # ── 1.7 Monitor de riesgo / Kill-Switches ────────────────────────
     st.html("<br>")
