@@ -1921,32 +1921,11 @@ def main():
         )
 
         n_projection = st.slider(
-            "Periodos hacia adelante (regimenes)",
+            "Periodos hacia adelante",
             min_value=1,
             max_value=30,
             value=10,
-            help="Cuantos periodos proyectar usando la matriz de transicion del HMM",
-        )
-
-        st.divider()
-        st.html(
-            '<p style="color:#FFD54F;font-size:0.75rem;letter-spacing:1px;'
-            'text-transform:uppercase;margin-bottom:8px;">📐 Rango Grid / LP</p>'
-        )
-
-        range_horizon = st.number_input(
-            "Horizonte del rango (periodos)",
-            min_value=1,
-            max_value=30,
-            value=7,
-            help="Periodos para proyectar el rango. Ej: 7 en 1D = 1 semana de rango",
-        )
-
-        z_score = st.select_slider(
-            "Z-Score (bandas de confianza)",
-            options=[1.0, 1.5, 2.0, 2.5, 3.0],
-            value=2.0,
-            help="1.5σ = ~87% confianza, 2σ = ~95%, 2.5σ = ~99%",
+            help="Cuantos periodos proyectar regimenes y rango de precios. Ej: 10 en 1D = 10 dias",
         )
 
         st.html("<br>")
@@ -1962,7 +1941,7 @@ def main():
         st.session_state.trained = False
 
     if train_button:
-        _run_pipeline(ticker, timeframe, n_regimes, n_projection, range_horizon, z_score)
+        _run_pipeline(ticker, timeframe, n_regimes, n_projection)
 
     if st.session_state.trained:
         _display_results()
@@ -1980,7 +1959,7 @@ def main():
 
 
 def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
-                  n_projection: int = 10, range_horizon: int = 7, z_score: float = 2.0):
+                  n_projection: int = 10):
     """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project -> range."""
     config = TIMEFRAME_CONFIG[timeframe]
 
@@ -2033,8 +2012,6 @@ def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
     st.session_state.timeframe = timeframe
     st.session_state.n_regimes = n_regimes
     st.session_state.n_projection = n_projection
-    st.session_state.range_horizon = range_horizon
-    st.session_state.z_score = z_score
     st.session_state.scaler = scaler
     st.session_state.converged = converged
     st.session_state.trained = True
@@ -2058,8 +2035,7 @@ def _display_results():
     current_color = color_map[current_regime]
     regime_means = model.means_[current_regime]
     scaler = st.session_state.scaler
-    range_horizon = st.session_state.get("range_horizon", 7)
-    z_score = st.session_state.get("z_score", 2.0)
+    n_projection = st.session_state.get("n_projection", 10)
 
     # ── 1. Card de regimen actual (full width, grande) ────────────────
     render_regime_card(current_label, current_color, ticker, timeframe, regime_means)
@@ -2067,7 +2043,7 @@ def _display_results():
     # ── 1.5 Calculo y Card de Rango Grid/LP ──────────────────────────
     last_close = float(df["Close"].squeeze().iloc[-1])
     range_data = compute_range_projection(
-        model, current_regime, last_close, range_horizon, z_score, scaler
+        model, current_regime, last_close, n_projection, 2.0, scaler
     )
     render_range_card(range_data, current_label, current_color, timeframe)
 
