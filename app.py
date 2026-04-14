@@ -1253,12 +1253,14 @@ def render_range_card(range_data: dict, current_label: str, current_color: str, 
 
 
 def render_strategy_recommendation(range_data: dict, current_label: str,
-                                    current_color: str, timeframe: str):
+                                    current_color: str, timeframe: str,
+                                    leverage: int = 1):
     """
     Recomienda LP concentrada vs Grid vs Hedge basado en:
     - Regimen actual (tendencia/fuerza)
     - Amplitud del rango operativo 80%
     - Sesgo direccional (prob_up vs prob_down)
+    - Leverage seleccionado (1x=spot, 2x+=futuros)
     """
     op80_amp = range_data["op80_amplitude"]
     prob_up = range_data["prob_up"]
@@ -1268,6 +1270,16 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
     last = range_data["last_close"]
     mid = range_data["mid"]
     skew = range_data["skew_ratio"]
+
+    # Fee roundtrip segun mercado
+    # Spot: maker 0.05% x2 = 0.10%
+    # Futuros: maker 0.02% + taker 0.05% = 0.07%
+    if leverage == 1:
+        fee_roundtrip = 0.10
+        market_label = "Spot"
+    else:
+        fee_roundtrip = 0.07
+        market_label = f"Futuros {leverage}x"
 
     # Clasificar regimen
     label_lower = current_label.lower()
@@ -1303,15 +1315,15 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         levels = max(50, min(100, int(op80_amp / 0.15)))
         spacing_pct = op80_amp / levels
         spacing_usd = (op80_upper - op80_lower) / levels
-        profit_per_grid = spacing_pct - 0.1  # descontando fee Pionex ~0.05% x2
+        profit_per_grid = (spacing_pct - fee_roundtrip) * leverage
         details = (
-            f"Grid de {levels} grillas entre [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
-            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%) entre niveles. "
-            f"Profit/grid: ~{profit_per_grid:.2f}% (neto de fees). "
+            f"<b>{market_label}</b> — Grid de {levels} grillas entre [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). "
+            f"Profit/grid: ~{profit_per_grid:.2f}% (fee RT: {fee_roundtrip:.2f}%, lev: {leverage}x). "
             f"Centrado en ${last:,.0f}."
         )
         risk = "Moderado. Si rompe el rango, el grid pierde inventario en un lado."
-        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} | {profit_per_grid:.2f}%/grid ({market_label})"
 
     elif (is_bull or is_bear) and not is_strong and moderate:
         strategy = "GRID ASIMETRICO"
@@ -1321,7 +1333,6 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         if is_bull:
             bias_dir = "alcista"
             more_levels_side = "arriba"
-            # 60/40 split: mas niveles arriba del precio actual
             levels_up = int(total_levels * 0.6)
             levels_down = total_levels - levels_up
         else:
@@ -1332,21 +1343,25 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
 
         spacing_pct = op80_amp / total_levels
         spacing_usd = (op80_upper - op80_lower) / total_levels
-        profit_per_grid = spacing_pct - 0.1
+        profit_per_grid = (spacing_pct - fee_roundtrip) * leverage
         reason = f"Tendencia {bias_dir} moderada = sesgar grid hacia {more_levels_side}"
         details = (
-            f"Grid asimetrico de {total_levels} grillas: {levels_up} arriba + {levels_down} abajo de ${last:,.0f}. "
+            f"<b>{market_label}</b> — Grid asimetrico de {total_levels} grillas: "
+            f"{levels_up} arriba + {levels_down} abajo de ${last:,.0f}. "
             f"Rango [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
-            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%."
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). "
+            f"Profit/grid: ~{profit_per_grid:.2f}% ({leverage}x)."
         )
-        risk = f"Moderado-Alto. Si revierte contra el sesgo, perdida de inventario."
-        grid_levels = f"{total_levels} grillas ({levels_up}up/{levels_down}dn) | ${spacing_usd:,.0f} | ~{profit_per_grid:.2f}%/grid"
+        risk = f"Moderado-Alto. Si revierte contra el sesgo, perdida de inventario x{leverage}."
+        grid_levels = f"{total_levels} grillas ({levels_up}up/{levels_down}dn) | ${spacing_usd:,.0f} | {profit_per_grid:.2f}%/grid ({market_label})"
 
     elif is_strong or wide:
         strategy = "NO OPERAR / HEDGE PURO"
         strategy_color = "#EF5350"
         strategy_icon = "🛑"
         reason = "Tendencia fuerte o rango muy amplio = IL destruye LP, grid pierde inventario"
+        if leverage > 1:
+            reason += f". Con {leverage}x el riesgo de liquidacion es alto"
         details = (
             f"Amplitud {op80_amp:.1f}% con regimen '{current_label}'. "
             f"El riesgo de impermanent loss o perdida de inventario es demasiado alto. "
@@ -1363,15 +1378,16 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         levels = max(30, min(60, int(op80_amp / 0.5)))
         spacing_pct = op80_amp / levels
         spacing_usd = (op80_upper - op80_lower) / levels
-        profit_per_grid = spacing_pct - 0.1
+        profit_per_grid = (spacing_pct - fee_roundtrip) * leverage
         details = (
-            f"Grid conservador de {levels} grillas con spacing amplio. "
+            f"<b>{market_label}</b> — Grid conservador de {levels} grillas. "
             f"Rango [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
-            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). "
+            f"Profit/grid: ~{profit_per_grid:.2f}% ({leverage}x). "
             f"Menos grillas para reducir exposicion ante la alta volatilidad."
         )
-        risk = "Moderado-Alto. Vol alta puede generar movimientos bruscos."
-        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
+        risk = f"Moderado-Alto. Vol alta puede generar movimientos bruscos{' (amplificado x' + str(leverage) + ')' if leverage > 1 else ''}."
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} | {profit_per_grid:.2f}%/grid ({market_label})"
 
     else:
         # Default: moderado sin tendencia clara
@@ -1381,15 +1397,16 @@ def render_strategy_recommendation(range_data: dict, current_label: str,
         levels = max(50, min(80, int(op80_amp / 0.2))) if op80_amp > 0 else 50
         spacing_pct = op80_amp / levels if op80_amp > 0 else 0.2
         spacing_usd = (op80_upper - op80_lower) / levels if levels > 0 else 0
-        profit_per_grid = spacing_pct - 0.1
+        profit_per_grid = (spacing_pct - fee_roundtrip) * leverage
         reason = "Condiciones mixtas — grid neutral como posicion base"
         details = (
-            f"Grid de {levels} grillas en [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
-            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). Profit/grid: ~{profit_per_grid:.2f}%. "
+            f"<b>{market_label}</b> — Grid de {levels} grillas en [${op80_lower:,.0f} — ${op80_upper:,.0f}]. "
+            f"Spacing: ${spacing_usd:,.0f} (~{spacing_pct:.2f}%). "
+            f"Profit/grid: ~{profit_per_grid:.2f}% ({leverage}x). "
             f"Monitorear regimen para ajustar."
         )
         risk = "Moderado."
-        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} spacing | ~{profit_per_grid:.2f}%/grid"
+        grid_levels = f"{levels} grillas | ${spacing_usd:,.0f} | {profit_per_grid:.2f}%/grid ({market_label})"
 
     # Posicion del precio dentro del rango 80%
     if op80_upper > op80_lower:
@@ -2139,6 +2156,19 @@ def main():
             help="Cuantos periodos proyectar regimenes y rango de precios. Ej: 10 en 1D = 10 dias",
         )
 
+        st.divider()
+        st.html(
+            '<p style="color:#787B86;font-size:0.75rem;letter-spacing:1px;'
+            'text-transform:uppercase;margin-bottom:8px;">Grid Bot Config</p>'
+        )
+
+        leverage = st.select_slider(
+            "Leverage",
+            options=[1, 2, 3, 5, 10, 20],
+            value=1,
+            help="1x = Spot. 2x+ = Futuros. Afecta fees y profit/grid",
+        )
+
         st.html("<br>")
         train_button = st.button("🚀 Entrenar Modelo", use_container_width=True)
 
@@ -2152,7 +2182,7 @@ def main():
         st.session_state.trained = False
 
     if train_button:
-        _run_pipeline(ticker, timeframe, n_regimes, n_projection)
+        _run_pipeline(ticker, timeframe, n_regimes, n_projection, leverage)
 
     if st.session_state.trained:
         _display_results()
@@ -2170,7 +2200,7 @@ def main():
 
 
 def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
-                  n_projection: int = 10):
+                  n_projection: int = 10, leverage: int = 1):
     """Ejecuta el pipeline completo: fetch -> features -> train -> decode -> project -> range."""
     config = TIMEFRAME_CONFIG[timeframe]
 
@@ -2223,6 +2253,7 @@ def _run_pipeline(ticker: str, timeframe: str, n_regimes: int,
     st.session_state.timeframe = timeframe
     st.session_state.n_regimes = n_regimes
     st.session_state.n_projection = n_projection
+    st.session_state.leverage = leverage
     st.session_state.scaler = scaler
     st.session_state.converged = converged
     st.session_state.trained = True
@@ -2259,7 +2290,8 @@ def _display_results():
     render_range_card(range_data, current_label, current_color, timeframe)
 
     # ── 1.6 Recomendacion de estrategia LP/Grid/Hedge ────────────────
-    render_strategy_recommendation(range_data, current_label, current_color, timeframe)
+    leverage = st.session_state.get("leverage", 1)
+    render_strategy_recommendation(range_data, current_label, current_color, timeframe, leverage)
 
     # ── 1.7 Monitor de riesgo / Kill-Switches ────────────────────────
     st.html("<br>")
