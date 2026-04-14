@@ -637,11 +637,13 @@ def run_single_window(features_all, close_all, df_all, cutoff_idx,
 
     v1_dir = "UP" if range_data["prob_up"] > 50 else "DOWN"
 
-    inside_iqr, inside_full = 0, 0
+    inside_iqr, inside_80, inside_full = 0, 0, 0
     for i in range(actual_horizon):
         p = float(real_prices[i])
         if range_data["tunnel_p25"][i] <= p <= range_data["tunnel_p75"][i]:
             inside_iqr += 1
+        if range_data["tunnel_p10"][i] <= p <= range_data["tunnel_p90"][i]:
+            inside_80 += 1
         if range_data["tunnel_lower"][i] <= p <= range_data["tunnel_upper"][i]:
             inside_full += 1
 
@@ -664,6 +666,7 @@ def run_single_window(features_all, close_all, df_all, cutoff_idx,
         "ad_s": dir_result["ad_s"], "ad_div": dir_result["ad_div"],
         "vpoc_s": dir_result["vpoc_s"],
         "iqr": round(inside_iqr / actual_horizon * 100, 1),
+        "op80": round(inside_80 / actual_horizon * 100, 1),
         "full": round(inside_full / actual_horizon * 100, 1),
     }
 
@@ -709,8 +712,8 @@ def run_cascade_backtest(ticker, n_regimes, n_windows, horizon, z_score):
               f"{'V1':>3s} | {'V4b':>3s} {'pUp':>5s} | {'Cap':>12s} | "
               f"{'HTF':>10s} | {'Agree':>10s} | "
               f"{'Sqz':>5s} {'Div':>10s} | {'ADX':>5s} | {'EMA':>5s} | "
-              f"{'A/D':>5s} | {'VPOC':>5s} | {'IQR':>5s} | {'Full':>5s}")
-        print(f"  {'-'*160}")
+              f"{'A/D':>5s} | {'VPOC':>5s} | {'IQR':>5s} | {'80%':>5s} | {'Full':>5s}")
+        print(f"  {'-'*170}")
 
         results = []
         for w in range(actual_win):
@@ -735,7 +738,7 @@ def run_cascade_backtest(ticker, n_regimes, n_windows, horizon, z_score):
                   f"{r['sqz_s']:>+5.2f} {r['sqz_div']:>10s} | "
                   f"{r['adx_s']:>+5.2f} | {r['ema_s']:>+5.2f} | "
                   f"{r['ad_s']:>+5.2f} | {r['vpoc_s']:>+5.2f} | "
-                  f"{r['iqr']:>4.1f}% | {r['full']:>4.1f}%")
+                  f"{r['iqr']:>4.1f}% | {r['op80']:>4.1f}% | {r['full']:>4.1f}%")
 
         tf_data[tf]["results"] = results
 
@@ -752,15 +755,16 @@ def run_cascade_backtest(ticker, n_regimes, n_windows, horizon, z_score):
             print(f"  {'-'*60}")
             print(f"  V1 (MC only):     {v1a:>6.1f}%")
             print(f"  V4b (ind+cascade): {v4a:>6.1f}%  ({ds})")
-            print(f"  IQR:              {df_r['iqr'].mean():>6.1f}%  (~50%)")
-            print(f"  Full:             {df_r['full'].mean():>6.1f}%  (~95%)")
+            print(f"  IQR (P25-P75):    {df_r['iqr'].mean():>6.1f}%  (esperado ~50%)")
+            print(f"  OP80 (P10-P90):   {df_r['op80'].mean():>6.1f}%  (esperado ~80%)")
+            print(f"  Full (z=2):       {df_r['full'].mean():>6.1f}%  (esperado ~95%)")
 
     # Final table
     print(f"\n\n{'='*100}")
     print("  COMPARATIVA FINAL -- V1 vs V4b (Hard Cascade + Divergence)")
     print(f"{'='*100}")
-    print(f"  {'TF':>4s} | {'Win':>3s} | {'V1':>6s} | {'V4b':>6s} | {'Delta':>6s} | {'IQR':>6s} | {'Full':>6s}")
-    print(f"  {'-'*50}")
+    print(f"  {'TF':>4s} | {'Win':>3s} | {'V1':>6s} | {'V4b':>6s} | {'Delta':>6s} | {'IQR':>6s} | {'OP80':>6s} | {'Full':>6s}")
+    print(f"  {'-'*60}")
 
     for tf in TIMEFRAMES_ORDER:
         res = tf_data[tf].get("results", [])
@@ -773,7 +777,8 @@ def run_cascade_backtest(ticker, n_regimes, n_windows, horizon, z_score):
         d = v4 - v1
         ds = f"+{d:.1f}%" if d >= 0 else f"{d:.1f}%"
         print(f"  {tf:>4s} | {n:>3d} | {v1:>5.1f}% | {v4:>5.1f}% | {ds:>6s} | "
-              f"{df_r['iqr'].mean():>5.1f}% | {df_r['full'].mean():>5.1f}%")
+              f"{df_r['iqr'].mean():>5.1f}% | {df_r['op80'].mean():>5.1f}% | "
+              f"{df_r['full'].mean():>5.1f}%")
 
     print(f"\n  Cascade temporal: datos del TF actual resampleados al TF superior")
     print(f"  Caps: STRONG_DOWN=max35% | LEAN_DOWN=max45% | LEAN_UP=min55% | STRONG_UP=min65%")

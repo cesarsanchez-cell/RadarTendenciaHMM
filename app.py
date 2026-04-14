@@ -905,15 +905,19 @@ def compute_range_projection(model: GaussianHMM, current_regime: int,
     tunnel_lower = []
     tunnel_mid = []        # mediana (p50)
     tunnel_expected = []   # media
+    tunnel_p10 = []        # P10 (rango operativo 80%)
     tunnel_p25 = []
     tunnel_p75 = []
+    tunnel_p90 = []        # P90 (rango operativo 80%)
 
     for t in range(1, horizon + 1):
         step_prices = prices[:, t]
         tunnel_lower.append(float(np.percentile(step_prices, lower_pct)))
+        tunnel_p10.append(float(np.percentile(step_prices, 10)))
         tunnel_p25.append(float(np.percentile(step_prices, 25)))
         tunnel_mid.append(float(np.percentile(step_prices, 50)))
         tunnel_p75.append(float(np.percentile(step_prices, 75)))
+        tunnel_p90.append(float(np.percentile(step_prices, 90)))
         tunnel_upper.append(float(np.percentile(step_prices, upper_pct)))
         tunnel_expected.append(float(np.mean(step_prices)))
 
@@ -939,6 +943,11 @@ def compute_range_projection(model: GaussianHMM, current_regime: int,
     iqr_lower = float(np.percentile(final_prices, 25))
     iqr_amplitude = (iqr_upper - iqr_lower) / last_close * 100
 
+    # Rango operativo 80% (P10-P90)
+    op80_upper = float(np.percentile(final_prices, 90))
+    op80_lower = float(np.percentile(final_prices, 10))
+    op80_amplitude = (op80_upper - op80_lower) / last_close * 100
+
     # Regimen dominante promedio
     regime_probs_avg = regime_counts_per_step.mean(axis=0) / n_simulations
 
@@ -956,6 +965,9 @@ def compute_range_projection(model: GaussianHMM, current_regime: int,
         "iqr_upper": iqr_upper,
         "iqr_lower": iqr_lower,
         "iqr_amplitude": iqr_amplitude,
+        "op80_upper": op80_upper,
+        "op80_lower": op80_lower,
+        "op80_amplitude": op80_amplitude,
         "z_score": z_score,
         "horizon": horizon,
         "last_close": last_close,
@@ -964,8 +976,10 @@ def compute_range_projection(model: GaussianHMM, current_regime: int,
         "tunnel_lower": tunnel_lower,
         "tunnel_mid": tunnel_mid,
         "tunnel_expected": tunnel_expected,
+        "tunnel_p10": tunnel_p10,
         "tunnel_p25": tunnel_p25,
         "tunnel_p75": tunnel_p75,
+        "tunnel_p90": tunnel_p90,
         "regime_probs_avg": regime_probs_avg,
     }
 
@@ -993,38 +1007,62 @@ def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
     all_dates = [last_date] + future_dates
     all_upper = [last_close] + range_data["tunnel_upper"]
     all_lower = [last_close] + range_data["tunnel_lower"]
+    all_p90 = [last_close] + range_data["tunnel_p90"]
     all_p75 = [last_close] + range_data["tunnel_p75"]
     all_p25 = [last_close] + range_data["tunnel_p25"]
+    all_p10 = [last_close] + range_data["tunnel_p10"]
     all_mid = [last_close] + range_data["tunnel_mid"]
 
-    # Banda exterior (z-score CI)
+    # Banda exterior (z-score CI ~95%)
     fig.add_trace(
         go.Scatter(
             x=all_dates, y=all_upper, mode="lines",
-            line=dict(color="#FFD54F", width=1.5, dash="dash"),
-            name=f"P{100-range_data['z_score']*100/2:.0f} Upper",
+            line=dict(color="#FFD54F", width=1, dash="dot"),
+            name=f"~95% CI",
             showlegend=True,
-            hovertemplate="Upper: $%{y:,.2f}<extra></extra>",
+            hovertemplate="P97.5: $%{y:,.2f}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Scatter(
             x=all_dates, y=all_lower, mode="lines",
-            line=dict(color="#FFD54F", width=1.5, dash="dash"),
-            name=f"P{range_data['z_score']*100/2:.0f} Lower",
+            line=dict(color="#FFD54F", width=1, dash="dot"),
+            name=f"~95% CI Lower",
             fill="tonexty",
-            fillcolor="rgba(255, 213, 79, 0.06)",
-            showlegend=True,
-            hovertemplate="Lower: $%{y:,.2f}<extra></extra>",
+            fillcolor="rgba(255, 213, 79, 0.04)",
+            showlegend=False,
+            hovertemplate="P2.5: $%{y:,.2f}<extra></extra>",
         )
     )
 
-    # Banda interior IQR (P25-P75, donde caen 50% de las simulaciones)
+    # Banda operativa 80% (P10-P90) — EL RANGO CLAVE
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates, y=all_p90, mode="lines",
+            line=dict(color="#AB47BC", width=2, dash="dash"),
+            name="Rango 80% (P90)",
+            showlegend=True,
+            hovertemplate="P90: $%{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=all_dates, y=all_p10, mode="lines",
+            line=dict(color="#AB47BC", width=2, dash="dash"),
+            name="Rango 80% (P10)",
+            fill="tonexty",
+            fillcolor="rgba(171, 71, 188, 0.10)",
+            showlegend=True,
+            hovertemplate="P10: $%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    # Banda interior IQR (P25-P75, 50%)
     fig.add_trace(
         go.Scatter(
             x=all_dates, y=all_p75, mode="lines",
             line=dict(color="#42A5F5", width=1.5),
-            name="P75 (IQR)",
+            name="P75 (IQR 50%)",
             showlegend=True,
             hovertemplate="P75: $%{y:,.2f}<extra></extra>",
         )
@@ -1033,9 +1071,9 @@ def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
         go.Scatter(
             x=all_dates, y=all_p25, mode="lines",
             line=dict(color="#42A5F5", width=1.5),
-            name="P25 (IQR)",
+            name="P25 (IQR 50%)",
             fill="tonexty",
-            fillcolor="rgba(66, 165, 245, 0.12)",
+            fillcolor="rgba(66, 165, 245, 0.10)",
             showlegend=True,
             hovertemplate="P25: $%{y:,.2f}<extra></extra>",
         )
@@ -1056,9 +1094,11 @@ def add_range_tunnel_to_chart(fig: go.Figure, range_data: dict,
     last_future = future_dates[-1]
     annotations = [
         (range_data["tunnel_upper"][-1], "#FFD54F", "left"),
+        (range_data["tunnel_p90"][-1], "#AB47BC", "left"),
         (range_data["tunnel_p75"][-1], "#42A5F5", "left"),
         (range_data["tunnel_mid"][-1], "#FFFFFF", "left"),
         (range_data["tunnel_p25"][-1], "#42A5F5", "left"),
+        (range_data["tunnel_p10"][-1], "#AB47BC", "left"),
         (range_data["tunnel_lower"][-1], "#FFD54F", "left"),
     ]
     for price, color, anchor in annotations:
@@ -1140,29 +1180,41 @@ def render_range_card(range_data: dict, current_label: str, current_color: str, 
         f'font-family:Consolas,Monaco,monospace;margin:0;">{bias_arrow} {prob_up:.0f}%↑ / {prob_down:.0f}%↓</p>'
         f'<p style="color:{bias_color};font-size:0.7rem;margin:0;">{bias_label}</p>'
         f'</div></div></div>'
-        # Rango IQR (operativo) + Rango completo
+        # Rangos: 80% (operativo) + IQR (50%) + Full (~95%)
         f'<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">'
-        # IQR Box
+        # 80% Box — EL RANGO CLAVE
+        f'<div style="flex:1.3;min-width:220px;background:#131722;border-radius:8px;'
+        f'padding:14px 16px;border:2px solid #AB47BC;">'
+        f'<p style="color:#AB47BC;font-size:0.75rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 8px 0;font-weight:700;">'
+        f'🎯 Rango Operativo (80% prob)</p>'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        f'<span style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.3rem;font-weight:700;">${range_data["op80_lower"]:,.2f} — ${range_data["op80_upper"]:,.2f}</span>'
+        f'<span style="color:#AB47BC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:1.2rem;font-weight:700;">{range_data["op80_amplitude"]:.1f}%</span>'
+        f'</div></div>'
+        # IQR Box (50%)
         f'<div style="flex:1;min-width:200px;background:#131722;border-radius:8px;'
         f'padding:14px 16px;border:1px solid #42A5F5;">'
         f'<p style="color:#42A5F5;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango Operativo (50% prob)</p>'
+        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango 50% (IQR)</p>'
         f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
         f'<span style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.2rem;font-weight:700;">${iqr_lower:,.2f} — ${iqr_upper:,.2f}</span>'
+        f'font-size:1.1rem;">${iqr_lower:,.2f} — ${iqr_upper:,.2f}</span>'
         f'<span style="color:{iqr_color};font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.1rem;font-weight:700;">{iqr_amp:.1f}%</span>'
+        f'font-size:1rem;">{iqr_amp:.1f}%</span>'
         f'</div></div>'
-        # Full range Box
+        # Full range Box (~95%)
         f'<div style="flex:1;min-width:200px;background:#131722;border-radius:8px;'
         f'padding:14px 16px;border:1px solid #FFD54F44;">'
         f'<p style="color:#FFD54F;font-size:0.7rem;text-transform:uppercase;'
-        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango Extremo (~{100-2*(100-prob_up if prob_up>50 else prob_up):.0f}% prob)</p>'
+        f'letter-spacing:0.8px;margin:0 0 8px 0;">Rango Extremo (~95%)</p>'
         f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
         f'<span style="color:#787B86;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.2rem;">${lower:,.2f} — ${upper:,.2f}</span>'
+        f'font-size:1.1rem;">${lower:,.2f} — ${upper:,.2f}</span>'
         f'<span style="color:#787B86;font-family:Consolas,Monaco,monospace;'
-        f'font-size:1.1rem;">{amp:.1f}%</span>'
+        f'font-size:1rem;">{amp:.1f}%</span>'
         f'</div></div></div>'
         # Grid de precios detallado
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;">'
@@ -1196,6 +1248,211 @@ def render_range_card(range_data: dict, current_label: str, current_color: str, 
         f'letter-spacing:0.8px;margin:0 0 3px 0;">Precio Actual</p>'
         f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
         f'font-size:1.1rem;font-weight:700;margin:0;">${last:,.2f}</p></div>'
+        f'</div></div>'
+    )
+
+
+def render_strategy_recommendation(range_data: dict, current_label: str,
+                                    current_color: str, timeframe: str):
+    """
+    Recomienda LP concentrada vs Grid vs Hedge basado en:
+    - Regimen actual (tendencia/fuerza)
+    - Amplitud del rango operativo 80%
+    - Sesgo direccional (prob_up vs prob_down)
+    """
+    op80_amp = range_data["op80_amplitude"]
+    prob_up = range_data["prob_up"]
+    prob_down = range_data["prob_down"]
+    op80_upper = range_data["op80_upper"]
+    op80_lower = range_data["op80_lower"]
+    last = range_data["last_close"]
+    mid = range_data["mid"]
+    skew = range_data["skew_ratio"]
+
+    # Clasificar regimen
+    label_lower = current_label.lower()
+    is_strong = "strong" in label_lower
+    is_sideways = "sideways" in label_lower
+    is_bull = "bull" in label_lower
+    is_bear = "bear" in label_lower
+
+    # Clasificar amplitud
+    narrow = op80_amp < 12
+    moderate = 12 <= op80_amp <= 25
+    wide = op80_amp > 25
+
+    # Determinar recomendacion
+    if is_sideways and narrow:
+        strategy = "LP CONCENTRADA"
+        strategy_color = "#4CAF50"
+        strategy_icon = "🎯"
+        reason = "Rango estrecho + sin tendencia = maximo fee generation"
+        details = (
+            f"Posicionar LP en [{op80_lower:,.0f} — {op80_upper:,.0f}] "
+            f"con concentracion alta. Amplitud {op80_amp:.1f}% es ideal para "
+            f"capturar fees sin sufrir IL significativo."
+        )
+        risk = "Bajo. Monitorear si ADX sube >25 (inicio de tendencia)."
+        grid_levels = "N/A — LP concentrada es mas eficiente en este escenario"
+
+    elif is_sideways and moderate:
+        strategy = "GRID SIMETRICO"
+        strategy_color = "#42A5F5"
+        strategy_icon = "📊"
+        reason = "Rango moderado + sin tendencia = cada rebote es profit"
+        levels = max(8, min(20, int(op80_amp / 1.5)))
+        spacing = op80_amp / levels
+        details = (
+            f"Grid de {levels} niveles entre [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
+            f"Spacing: ~{spacing:.1f}% entre niveles. "
+            f"Centrado en precio actual (${last:,.0f})."
+        )
+        risk = "Moderado. Si rompe el rango, el grid pierde inventario en un lado."
+        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+
+    elif (is_bull or is_bear) and not is_strong and moderate:
+        strategy = "GRID ASIMETRICO"
+        strategy_color = "#FFD54F"
+        strategy_icon = "📐"
+        if is_bull:
+            bias_dir = "alcista"
+            more_levels_side = "arriba"
+            # Mas niveles arriba del precio actual
+            levels_up = 8
+            levels_down = 5
+        else:
+            bias_dir = "bajista"
+            more_levels_side = "abajo"
+            levels_up = 5
+            levels_down = 8
+
+        total_levels = levels_up + levels_down
+        reason = f"Tendencia {bias_dir} moderada = sesgar grid hacia {more_levels_side}"
+        details = (
+            f"Grid asimetrico: {levels_up} niveles arriba + {levels_down} abajo del precio actual. "
+            f"Rango [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
+            f"Mas niveles en la direccion del sesgo para capturar el movimiento."
+        )
+        risk = f"Moderado-Alto. Si revierte contra el sesgo, perdida de inventario."
+        grid_levels = f"{total_levels} niveles ({levels_up} up / {levels_down} down)"
+
+    elif is_strong or wide:
+        strategy = "NO OPERAR / HEDGE PURO"
+        strategy_color = "#EF5350"
+        strategy_icon = "🛑"
+        reason = "Tendencia fuerte o rango muy amplio = IL destruye LP, grid pierde inventario"
+        details = (
+            f"Amplitud {op80_amp:.1f}% con regimen '{current_label}'. "
+            f"El riesgo de impermanent loss o perdida de inventario es demasiado alto. "
+            f"Mantener hedge delta-neutral puro hasta que el regimen cambie a Sideways o la vol baje."
+        )
+        risk = "Alto. Esperar cambio de regimen antes de posicionar."
+        grid_levels = "N/A — No se recomienda operar grid/LP"
+
+    elif is_sideways and wide:
+        strategy = "GRID AMPLIO CONSERVADOR"
+        strategy_color = "#FF9800"
+        strategy_icon = "⚠️"
+        reason = "Sin tendencia pero vol alta = grid con spacing amplio"
+        levels = max(6, min(12, int(op80_amp / 3)))
+        spacing = op80_amp / levels
+        details = (
+            f"Grid conservador de {levels} niveles con spacing amplio (~{spacing:.1f}%). "
+            f"Rango [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
+            f"Menos niveles para reducir exposicion ante la alta volatilidad."
+        )
+        risk = "Moderado-Alto. Vol alta puede generar movimientos bruscos."
+        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+
+    else:
+        # Default: moderado sin tendencia clara
+        strategy = "GRID NEUTRAL"
+        strategy_color = "#78909C"
+        strategy_icon = "⚖️"
+        levels = 10
+        spacing = op80_amp / levels if op80_amp > 0 else 1
+        reason = "Condiciones mixtas — grid neutral como posicion base"
+        details = (
+            f"Grid de {levels} niveles en [{op80_lower:,.0f} — {op80_upper:,.0f}]. "
+            f"Monitorear regimen para ajustar."
+        )
+        risk = "Moderado."
+        grid_levels = f"{levels} niveles | Spacing: {spacing:.1f}%"
+
+    # Posicion del precio dentro del rango 80%
+    if op80_upper > op80_lower:
+        position_in_range = (last - op80_lower) / (op80_upper - op80_lower) * 100
+    else:
+        position_in_range = 50
+
+    if position_in_range > 75:
+        pos_label = "Cerca del techo"
+        pos_color = "#EF5350"
+    elif position_in_range < 25:
+        pos_label = "Cerca del piso"
+        pos_color = "#4CAF50"
+    else:
+        pos_label = "Zona central"
+        pos_color = "#78909C"
+
+    st.html(
+        f'<div style="background:linear-gradient(135deg,#1E222D 0%,#131722 100%);'
+        f'border-radius:12px;padding:24px 28px;margin-bottom:16px;'
+        f'border:1px solid #2A2E39;border-top:3px solid {strategy_color};'
+        f'box-shadow:0 4px 24px rgba(0,0,0,0.3);">'
+        # Header
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'margin-bottom:16px;flex-wrap:wrap;gap:12px;">'
+        f'<div>'
+        f'<p style="color:{strategy_color};font-size:0.75rem;text-transform:uppercase;'
+        f'letter-spacing:1px;margin:0 0 4px 0;">RECOMENDACION DE ESTRATEGIA</p>'
+        f'<p style="color:{strategy_color};font-size:1.8rem;font-weight:700;'
+        f'font-family:Consolas,Monaco,monospace;margin:0;">'
+        f'{strategy_icon} {strategy}</p>'
+        f'</div>'
+        f'<div style="text-align:right;">'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">Regimen: {current_label}</p>'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0;">Amplitud 80%: {op80_amp:.1f}%</p>'
+        f'</div></div>'
+        # Razon
+        f'<div style="background:#131722;border-radius:8px;padding:12px 16px;'
+        f'margin-bottom:12px;border-left:3px solid {strategy_color};">'
+        f'<p style="color:#D1D4DC;font-size:0.9rem;margin:0;line-height:1.5;">'
+        f'<b>Por que:</b> {reason}</p></div>'
+        # Detalles
+        f'<div style="background:#131722;border-radius:8px;padding:12px 16px;'
+        f'margin-bottom:12px;border:1px solid #2A2E39;">'
+        f'<p style="color:#D1D4DC;font-size:0.85rem;margin:0;line-height:1.5;">'
+        f'{details}</p></div>'
+        # Grid de metricas
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;">'
+        # Grid levels
+        f'<div style="flex:1;min-width:150px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Grid Config</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:0.9rem;margin:0;">{grid_levels}</p></div>'
+        # Position in range
+        f'<div style="flex:1;min-width:150px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Posicion en Rango 80%</p>'
+        f'<p style="color:{pos_color};font-family:Consolas,Monaco,monospace;'
+        f'font-size:0.9rem;margin:0;">{pos_label} ({position_in_range:.0f}%)</p></div>'
+        # Risk
+        f'<div style="flex:1;min-width:150px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Riesgo</p>'
+        f'<p style="color:#D1D4DC;font-size:0.85rem;margin:0;">{risk}</p></div>'
+        # Sesgo
+        f'<div style="flex:1;min-width:150px;background:#131722;border-radius:8px;'
+        f'padding:10px 14px;border:1px solid #2A2E39;">'
+        f'<p style="color:#787B86;font-size:0.65rem;text-transform:uppercase;'
+        f'letter-spacing:0.8px;margin:0 0 3px 0;">Sesgo Direccional</p>'
+        f'<p style="color:#D1D4DC;font-family:Consolas,Monaco,monospace;'
+        f'font-size:0.9rem;margin:0;">{prob_up:.0f}% UP / {prob_down:.0f}% DN</p></div>'
         f'</div></div>'
     )
 
@@ -1813,6 +2070,9 @@ def _display_results():
         model, current_regime, last_close, range_horizon, z_score, scaler
     )
     render_range_card(range_data, current_label, current_color, timeframe)
+
+    # ── 1.6 Recomendacion de estrategia LP/Grid/Hedge ────────────────
+    render_strategy_recommendation(range_data, current_label, current_color, timeframe)
 
     # ── 2. Grafico de velas + tunel de rango (full width, grande) ────
     fig_candle = plot_candlestick_with_regimes(
