@@ -1503,19 +1503,55 @@ def compute_atr(df, period: int = 14) -> float:
     return float(atr.iloc[-1])
 
 
+def _compute_density_factor(regime_label: str, op80_amp: float) -> tuple:
+    """
+    Determina el divisor de ATR segun regimen y amplitud.
+    Retorna (divisor, descripcion).
+    Mayor divisor = mas grillas = spacing mas chico.
+    """
+    label = regime_label.lower()
+    is_strong = "strong" in label
+    is_sideways = "sideways" in label
+    is_bull = "bull" in label
+    is_bear = "bear" in label
+
+    # Volatilidad relativa del rango
+    low_vol = op80_amp < 12
+    high_vol = op80_amp > 25
+
+    if is_sideways and low_vol:
+        return 4, "Sideways + vol baja → ATR/4 (micro-rebotes)"
+    elif is_sideways and high_vol:
+        return 2, "Sideways + vol alta → ATR/2 (rebotes amplios)"
+    elif is_sideways:
+        return 3, "Sideways moderado → ATR/3"
+    elif (is_bull or is_bear) and not is_strong:
+        return 3, f"Tendencia moderada → ATR/3"
+    elif is_strong:
+        return 2, "Tendencia fuerte → ATR/2 (poco rebote)"
+    else:
+        return 3, "Default → ATR/3"
+
+
 def generate_geometric_grid(lower: float, upper: float, atr: float,
                             fee_rt_pct: float, leverage: int,
-                            last_close: float, total_investment: float = 10000):
+                            last_close: float, regime_label: str = "",
+                            op80_amp: float = 0,
+                            total_investment: float = 10000):
     """
-    Genera grillas con progresion geometrica basada en ATR/2,
+    Genera grillas con progresion geometrica basada en ATR/densidad,
     con floor en 2*fee_RT, y sizing gaussiano.
+    La densidad se adapta al regimen actual.
 
-    Returns: list of dicts con price, size, weight, cumulative
+    Returns: (grid_data, spacing_pct, atr_pct, density, density_desc)
     """
-    # Spacing base = ATR/2 en porcentaje del precio medio
+    # Factor de densidad adaptativo al regimen
+    density, density_desc = _compute_density_factor(regime_label, op80_amp)
+
+    # Spacing base = ATR/densidad en porcentaje del precio medio
     mid = (upper + lower) / 2
     atr_pct = (atr / mid) * 100  # ATR como % del precio medio
-    spacing_pct = atr_pct / 2    # ATR/2
+    spacing_pct = atr_pct / density
 
     # Floor: minimo rentable = 2 * fee_RT
     min_spacing = 2 * fee_rt_pct
@@ -1537,7 +1573,7 @@ def generate_geometric_grid(lower: float, upper: float, atr: float,
 
     n_levels = len(levels)
     if n_levels < 2:
-        return [], spacing_pct, atr_pct
+        return [], spacing_pct, atr_pct, density, density_desc
 
     # Gaussian weighting: centro en last_close, sigma = rango/4
     sigma = (upper - lower) / 4  # 95% del peso dentro del rango
@@ -1578,11 +1614,11 @@ def generate_geometric_grid(lower: float, upper: float, atr: float,
             "profit_pct": local_profit,
         })
 
-    return grid_data, spacing_pct, atr_pct
+    return grid_data, spacing_pct, atr_pct, density, density_desc
 
 
-def render_grid_table(df, range_data: dict, leverage: int = 1,
-                      total_investment: float = 10000):
+def render_grid_table(df, range_data: dict, current_label: str,
+                      leverage: int = 1, total_investment: float = 10000):
     """
     Renderiza la tabla de grillas geometricas con sizing gaussiano.
     """
@@ -1594,9 +1630,11 @@ def render_grid_table(df, range_data: dict, leverage: int = 1,
 
     # Fee segun mercado
     fee_rt = 0.10 if leverage == 1 else 0.07
+    op80_amp = range_data.get("op80_amplitude", 0)
 
-    grid_data, spacing_pct, atr_pct = generate_geometric_grid(
-        op80_lower, op80_upper, atr, fee_rt, leverage, last_close, total_investment
+    grid_data, spacing_pct, atr_pct, density, density_desc = generate_geometric_grid(
+        op80_lower, op80_upper, atr, fee_rt, leverage, last_close,
+        current_label, op80_amp, total_investment
     )
 
     if not grid_data:
@@ -1629,7 +1667,9 @@ def render_grid_table(df, range_data: dict, leverage: int = 1,
         f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
         f'ATR(14): ${atr:,.0f} ({atr_pct:.2f}%)</p>'
         f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
-        f'Spacing base: {spacing_pct:.2f}% (ATR/2)</p>'
+        f'Spacing: {spacing_pct:.2f}% (ATR/{density})</p>'
+        f'<p style="color:#787B86;font-size:0.7rem;margin:0 0 2px 0;">'
+        f'Densidad: {density}x — {density_desc}</p>'
         f'<p style="color:#787B86;font-size:0.7rem;margin:0;">'
         f'Floor fee: {2*fee_rt:.2f}%</p>'
         f'</div></div>'
@@ -1663,8 +1703,8 @@ def render_grid_table(df, range_data: dict, leverage: int = 1,
         f'margin-bottom:16px;border-left:3px solid #AB47BC;">'
         f'<p style="color:#787B86;font-size:0.75rem;margin:0;line-height:1.5;">'
         f'<b style="color:#D1D4DC;">Formula:</b> '
-        f'spacing = max(ATR/2, 2*fee) | '
-        f'price[i+1] = price[i] * (1 + spacing%) | '
+        f'spacing = max(ATR/{density}, 2*fee) | '
+        f'price[i+1] = price[i] * (1 + {spacing_pct:.2f}%) | '
         f'size[i] = inv * gauss(price[i], center=${last_close:,.0f}, '
         f'sigma=${(op80_upper-op80_lower)/4:,.0f})</p>'
         f'</div>'
@@ -2550,7 +2590,7 @@ def _display_results():
 
     # ── 1.65 Tabla de grillas geometricas + Gauss sizing ─────────────
     grid_investment = st.session_state.get("grid_investment", 10000)
-    render_grid_table(df, range_data, leverage, grid_investment)
+    render_grid_table(df, range_data, current_label, leverage, grid_investment)
 
     # ── 1.7 Monitor de riesgo / Kill-Switches ────────────────────────
     st.html("<br>")
